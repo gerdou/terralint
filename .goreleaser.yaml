@@ -7,12 +7,12 @@ before:
 builds:
   - env:
       - CGO_ENABLED=0
+    flags:
+      - -mod=vendor
     goos:
       - linux
       - windows
       - darwin
-    flags:
-      - -mod=vendor
 archives:
   - format: tar.gz
     name_template: >-
@@ -26,21 +26,21 @@ archives:
       - goos: windows
         format: zip
 brews:
-  - url_template: "https://github.com/vahid-haghighat/terralint/releases/download/{{ .Tag }}/{{ .ArtifactName }}"
+  - url_template: "https://github.com/gerdou/terralint/releases/download/{{ .Tag }}/{{ .ArtifactName }}"
     download_strategy: CurlDownloadStrategy
     commit_author:
-      name: terralint release bot
-      email: bot@goreleaser.com
-    homepage: "https://github.com/vahid-haghighat/terralint"
+      name: gerdou-app[bot]
+      email: 2530509+gerdou-app[bot]@users.noreply.github.com
+    homepage: "https://github.com/gerdou/terralint"
     description: "An opinionated terraform linter"
     license: "MIT"
     test: system "#{bin}/terralint --version"
     install: bin.install "terralint"
     repository:
-      owner: brewdex
+      owner: gerdou
       name: homebrew-terralint
       branch: main
-      token: "{{ .Env.BREWDEX_GITHUB_TOKEN }}"
+      token: "{{ .Env.GITHUB_TOKEN }}"
 changelog:
   sort: asc
   filters:
