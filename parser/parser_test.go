@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/vahid-haghighat/terralint/parser/types"
+	"github.com/gerdou/terralint/parser/types"
 )
 
 // TestCase represents a test case for the parser

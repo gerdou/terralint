@@ -7,7 +7,7 @@ An opinionated terraform linter.
 ### Homebrew
 You can install the app using the following commands:
 ```shell
-brew tap brewdex/terralint
+brew tap gerdou/terralint
 brew install terralint
 ```
 
@@ -17,5 +17,5 @@ Download the executable from the release page for your operating system.
 ### Build
 If you have `go` installed, run:
 ```shell
-go install github.com/vahid-haghighat/terralint@latest
+go install github.com/gerdou/terralint@latest
 ```

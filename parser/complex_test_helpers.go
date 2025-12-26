@@ -1,7 +1,7 @@
 package parser
 
 import (
-	"github.com/vahid-haghighat/terralint/parser/types"
+	"github.com/gerdou/terralint/parser/types"
 )
 
 // createComplexModuleExpected creates the expected structure for 01_complex_module.tf

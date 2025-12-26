@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/sergi/go-diff/diffmatchpatch"
-	"github.com/vahid-haghighat/terralint/parser"
+	"github.com/gerdou/terralint/parser"
 
-	"github.com/vahid-haghighat/terralint/parser/types"
+	"github.com/gerdou/terralint/parser/types"
 )
 
 func Check(filePath string) error {
