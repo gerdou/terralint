@@ -4,7 +4,7 @@ package main
 //	"fmt"
 //	"os"
 //
-//	"github.com/vahid-haghighat/terralint/debug"
+//	"github.com/gerdou/terralint/debug"
 //)
 //
 //func main() {

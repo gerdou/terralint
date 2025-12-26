@@ -1,7 +1,7 @@
 package internal
 
 import (
-	"github.com/vahid-haghighat/terralint/parser"
+	"github.com/gerdou/terralint/parser"
 	"os"
 )
 

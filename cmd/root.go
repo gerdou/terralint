@@ -4,8 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"github.com/spf13/cobra"
-	"github.com/vahid-haghighat/terralint/cmd/utilities"
-	"github.com/vahid-haghighat/terralint/version"
+	"github.com/gerdou/terralint/cmd/utilities"
+	"github.com/gerdou/terralint/version"
 	"os"
 )
 

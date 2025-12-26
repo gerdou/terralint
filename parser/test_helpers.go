@@ -1,7 +1,7 @@
 package parser
 
 import (
-	"github.com/vahid-haghighat/terralint/parser/types"
+	"github.com/gerdou/terralint/parser/types"
 )
 
 // createSimpleTerraformExpected creates the expected structure for simple_test.tf

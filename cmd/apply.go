@@ -2,7 +2,7 @@ package cmd
 
 import (
 	"github.com/spf13/cobra"
-	"github.com/vahid-haghighat/terralint/cmd/internal"
+	"github.com/gerdou/terralint/cmd/internal"
 )
 
 // applyCmd represents the apply command

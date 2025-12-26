@@ -10,7 +10,7 @@ import (
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	sitter "github.com/smacker/go-tree-sitter"
-	"github.com/vahid-haghighat/terralint/parser/types"
+	"github.com/gerdou/terralint/parser/types"
 	"github.com/zclconf/go-cty/cty"
 )
 
