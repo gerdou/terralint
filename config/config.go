@@ -54,8 +54,22 @@ type Naming struct {
 	// block (the second label of a resource; the first of a variable), which
 	// is where Terraform puts the name. A type left out keeps its names, and
 	// so do the references to them in every file of the directory; without
-	// "variable" or "output", so do .tfvars assignments and module call
-	// arguments, or the outputs read from a module call.
+	// "variable", so do .tfvars assignments and module call arguments.
+	//
+	// Without "output", a read of a module call's output keeps the output's
+	// name (module.<name>.<output>, after an index or [*] too), and the keys
+	// read after it are renamed, as the child renames its output's value.
+	// Reads that do not start at module.<name> are renamed in full, because
+	// the formatter cannot tell they read an output, and then no longer
+	// match it: through a for-expression variable ([for m in module.x :
+	// m.out]), a function's result (values(module.x)[0].out) or remote
+	// state (outputs.<name>).
+	//
+	// "provider" is left out by default: provider local names keep their
+	// dashes wherever they appear (required_providers and everything in it,
+	// provider block labels, the provider and providers meta-arguments),
+	// because Terraform rejects "_" in them (google_beta fails terraform
+	// init). With "provider" here, they are renamed in all those places.
 	Labels map[string]int `yaml:"labels"`
 }
 
@@ -118,7 +132,7 @@ func Default() *Config {
 		Naming: Naming{
 			Replace: "-",
 			With:    "_",
-			Labels:  map[string]int{"variable": 0, "output": 0, "module": 0, "provider": 0, "dynamic": 0, "resource": 1, "data": 1, "ephemeral": 1},
+			Labels:  map[string]int{"variable": 0, "output": 0, "module": 0, "dynamic": 0, "resource": 1, "data": 1, "ephemeral": 1},
 		},
 		TopLevel: topLevel,
 		Priorities: map[string]Priority{

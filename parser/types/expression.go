@@ -50,7 +50,7 @@ func (l *LiteralValue) Range() hcl.Range {
 type ObjectExpr struct {
 	ExprComments
 	Items       []ObjectItem
-	OpenComment string // The comments on the opening brace's line, after it, when the first item starts on a later line and no enclosing item holds them as its InlineComment, one per line
+	OpenComment string // The comments on the opening brace's line, after it, when the first item starts on a later line, one per line. When the object is the value of an item that starts on that line, the item holds the first one as its InlineComment instead; when the object is in that item's list or call value, the item holds the first one too (InlineInside)
 	EndComment  string // The comments after the last item (or the opening brace, when there is none), on their own lines, one per line
 	ExprRange   hcl.Range
 }
@@ -59,7 +59,7 @@ type ObjectItem struct {
 	Key           Expression
 	Value         Expression
 	InlineComment string // The first comment on the item's first line, after its start and before the next item or the closing brace
-	InlineInside  bool   // InlineComment is also the InlineComment of an object item inside the value that starts on the same line; it follows that item
+	InlineInside  bool   // InlineComment is also held inside the value, which prints it: as the InlineComment of an object item there that starts on the same line, or, when it comes after the first element of a list or call value starts, as a comment of that list's or call's parts; it follows that item or part
 	BlockComment  string // The comments on the lines between the previous item (or the opening brace) and this one, one per line
 	TrailComment  string // The comments after the item on its last line, besides InlineComment
 	ExprRange     hcl.Range

@@ -72,8 +72,10 @@ type prefix struct {
 	deep  bool
 }
 
-// declaring are the block types whose names references use (see declares).
-var declaring = []string{"variable", "module", "resource", "data", "ephemeral", "provider"}
+// declaring are the block types whose names references use (see declares),
+// but provider: provider local names the rule does not rename keep theirs
+// where they appear (see providerPlace), with no exemption to collect.
+var declaring = []string{"variable", "module", "resource", "data", "ephemeral"}
 
 // exemptions collects the exempt names declared in path and the other .tf
 // and .tfvars files of its directory. Files that do not mention the marker
@@ -134,7 +136,8 @@ func (ex *exemptions) collect(f *formatter, e *entry) {
 			ex.prefixes = append(ex.prefixes, prefix{[]string{"var", n.Name}, true})
 		}
 	case *types.Block:
-		if p := declares(n); p != nil && (off || !f.renames(n.Type)) {
+		renamed := f.renames(n.Type)
+		if p := declares(n); p != nil && (off || !renamed) && (renamed || n.Type != "provider") {
 			// The steps after module.<name> are the child module's outputs,
 			// which follow the child's own declarations.
 			ex.prefixes = append(ex.prefixes, prefix{p, off && n.Type != "module"})

@@ -129,10 +129,11 @@ func (c *converter) leading(afterLine, beforeLine int) string {
 }
 
 // inline returns the first comment on start's line that starts after start
-// and before the byte offset limit. An item inside this one that starts on
-// the same line can have the same comment as its InlineComment; inside,
-// called once the item's insides are converted, reports whether one does.
-func (c *converter) inline(start hcl.Pos, limit int) (text string, inside func() bool) {
+// and before the byte offset limit, and its index (-1 for none). An item
+// inside this one that starts on the same line can have the same comment as
+// its InlineComment; inside, called once the item's insides are converted,
+// reports whether one does.
+func (c *converter) inline(start hcl.Pos, limit int) (text string, index int, inside func() bool) {
 	for i := c.commentsFrom(start.Line); i < len(c.comments); i++ {
 		tok := c.comments[i]
 		if tok.Range.Start.Line > start.Line || tok.Range.Start.Byte >= limit {
@@ -141,10 +142,39 @@ func (c *converter) inline(start hcl.Pos, limit int) (text string, inside func()
 		if tok.Range.Start.Byte > start.Byte {
 			c.inlines[i]++
 			n := c.inlines[i]
-			return c.join([]int{i}), func() bool { return c.inlines[i] > n }
+			return c.join([]int{i}), i, func() bool { return c.inlines[i] > n }
 		}
 	}
-	return "", func() bool { return false }
+	return "", -1, func() bool { return false }
+}
+
+// inValue gives an item's inline comment (index i, -1 for none) to the part
+// of the item's list or call value it is in or next to, when it comes after
+// the start of the first element and before the end of the value: the
+// printer may put the elements on lines of their own, and the comment must
+// stay with its element there (on the line [{ # label, after the {; after
+// "a", # note, after "a"). It reports whether it did; the item's copy is then
+// not printed.
+func (c *converter) inValue(value types.Expression, i int) bool {
+	var first types.Expression
+	switch v := value.(type) {
+	case *types.ArrayExpr:
+		if len(v.Items) > 0 {
+			first = v.Items[0]
+		}
+	case *types.FunctionCallExpr:
+		if len(v.Args) > 0 {
+			first = v.Args[0]
+		}
+	}
+	if i < 0 || first == nil {
+		return false
+	}
+	if pos := c.comments[i].Range.Start.Byte; pos < first.Range().Start.Byte || pos >= value.Range().End.Byte {
+		return false
+	}
+	c.attach(value, []int{i})
+	return true
 }
 
 // lastLine is the line a comment ends on; a line comment's token takes in
@@ -219,7 +249,7 @@ func (c *converter) body(body *hclsyntax.Body, openLine, startByte, endByte int)
 		}
 		start := item.Range().Start
 		blockComment := c.leading(prevEndLine, start.Line)
-		inlineComment, inlineInside := c.inline(start, limit)
+		inlineComment, inlineIndex, inlineInside := c.inline(start, limit)
 
 		switch item := item.(type) {
 		case *hclsyntax.Attribute:
@@ -227,13 +257,14 @@ func (c *converter) body(body *hclsyntax.Body, openLine, startByte, endByte int)
 			if err != nil {
 				return nil, "", fmt.Errorf("failed to convert attribute %s (line %d): %w", item.Name, start.Line, err)
 			}
+			inside := inlineInside() || c.inValue(value, inlineIndex)
 			c.attachValue(value, item.SrcRange)
 			attr := &types.Attribute{
 				Name:          item.Name,
 				Value:         value,
 				Range:         item.SrcRange,
 				InlineComment: inlineComment,
-				InlineInside:  inlineInside(),
+				InlineInside:  inside,
 				BlockComment:  blockComment,
 			}
 			children = append(children, attr)
@@ -743,7 +774,7 @@ func (c *converter) expr(expr hclsyntax.Expression) (types.Expression, error) {
 			start := item.KeyExpr.Range().Start
 			// Claim the item's own comments before those inside its value.
 			blockComment := c.leading(prevEndLine, start.Line)
-			inlineComment, inlineInside := c.inline(start, limit)
+			inlineComment, inlineIndex, inlineInside := c.inline(start, limit)
 			key, err := c.expr(item.KeyExpr)
 			if err != nil {
 				return nil, err
@@ -756,7 +787,7 @@ func (c *converter) expr(expr hclsyntax.Expression) (types.Expression, error) {
 				Key:           key,
 				Value:         value,
 				InlineComment: inlineComment,
-				InlineInside:  inlineInside(),
+				InlineInside:  inlineInside() || c.inValue(value, inlineIndex),
 				BlockComment:  blockComment,
 				ExprRange:     hcl.RangeBetween(item.KeyExpr.Range(), item.ValueExpr.Range()),
 			}

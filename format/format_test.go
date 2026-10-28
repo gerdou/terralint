@@ -306,12 +306,12 @@ resource "aws_x" "my-y" {
     }
   }
 }
-`, `provider "google_beta" {}
+`, `provider "google-beta" {}
 
 resource "aws_x" "my_y" {
   for_each = { for my_k, my_v in var.my_m : my_k => my_v... }
 
-  provider = google_beta
+  provider = google-beta
 
   key  = local.m["my-key"]
   name = "${var.a_b}-c-d"
@@ -1034,7 +1034,7 @@ resource "google_x" "y" {
 
 variable "my_var" {}
 `},
-		{"module", `provider "google_beta" {}
+		{"module", `provider "google-beta" {}
 
 module "vpc-main" {
   source = "./x"
@@ -1043,14 +1043,14 @@ module "vpc-main" {
 }
 
 resource "google_x" "y" {
-  provider = google_beta
+  provider = google-beta
 
   v = [module.vpc-main.out_x, var.my_var.sub_key]
 }
 
 variable "my_var" {}
 `},
-		{"variable", `provider "google_beta" {}
+		{"variable", `provider "google-beta" {}
 
 module "vpc_main" {
   source = "./x"
@@ -1059,14 +1059,14 @@ module "vpc_main" {
 }
 
 resource "google_x" "y" {
-  provider = google_beta
+  provider = google-beta
 
   v = [module.vpc_main.out_x, var.my-var.sub_key]
 }
 
 variable "my-var" {}
 `},
-		{"output", `provider "google_beta" {}
+		{"output", `provider "google-beta" {}
 
 module "vpc_main" {
   source = "./x"
@@ -1075,7 +1075,7 @@ module "vpc_main" {
 }
 
 resource "google_x" "y" {
-  provider = google_beta
+  provider = google-beta
 
   v = [module.vpc_main.out-x, var.my_var.sub_key]
 }
@@ -1296,4 +1296,243 @@ EOT
 	if !strings.Contains(got, "%{if var.x}yes%{else}no%{endif}") || !strings.Contains(got, "# c") {
 		t.Errorf("comment before a directive keyword:\n%s", got)
 	}
+}
+
+func TestRound3Comments(t *testing.T) {
+	// A comment after the first element of a list or call value starts, on
+	// the item's first line, stays with that element when the elements go
+	// on lines of their own (R3a-001).
+	check(t, nil, `locals {
+  cidrs = ["10.0.0.0/8", # corporate network
+    "192.168.0.0/16",    # VPN users
+  ]
+  subnets = [{ # public
+    name = "a"
+    cidr = "10.0.0.0/24"
+    }, { # private
+    name = "b"
+    cidr = "10.0.1.0/24"
+  }]
+  tags = merge(local.common, { # per-bucket
+    Name = "logs"
+  }, var.extra)
+  boxed = merge(var.tags, (/* box */ (var.on ? var.a : {})))
+  rules = {
+    web = [{ # HTTPS
+      port = 443
+    }]
+  }
+  open  = [ # the whole list
+    "a",
+  ]
+  after = ["a", "b"] # after the list
+}
+`, `locals {
+  after = ["a", "b"] # after the list
+
+  boxed = merge(
+    var.tags,
+    (
+      # box
+      (var.on ? var.a : {})
+    ),
+  )
+
+  cidrs = [
+    "10.0.0.0/8",     # corporate network
+    "192.168.0.0/16", # VPN users
+  ]
+
+  open = ["a"] # the whole list
+
+  rules = {
+    web = [
+      { # HTTPS
+        port = 443
+      },
+    ]
+  }
+
+  subnets = [
+    { # public
+      cidr = "10.0.0.0/24"
+      name = "a"
+    },
+    { # private
+      cidr = "10.0.1.0/24"
+      name = "b"
+    },
+  ]
+
+  tags = merge(
+    local.common,
+    { # per-bucket
+      Name = "logs"
+    },
+    var.extra,
+  )
+}
+`)
+}
+
+func TestRound3Naming(t *testing.T) {
+	// Provider local names keep their dashes everywhere they appear, because
+	// Terraform rejects "_" in them (D12; R3b-001, R3b-002).
+	src := `terraform {
+  required_providers {
+    google-beta = {
+      source                = "hashicorp/google-beta"
+      configuration_aliases = [google-beta.us-east]
+    }
+  }
+}
+
+provider "google-beta" {
+  alias      = "us-east"
+  my-setting = var.my-var
+}
+
+module "my-mod" {
+  source = "./m"
+  providers = {
+    google-beta = google-beta.us-east
+  }
+}
+
+resource "google_x" "my-y" {
+  provider = google-beta.us-east
+  name     = provider::google-beta::f(var.my-var)
+}
+
+import {
+  provider = google-beta
+  to       = google_x.my-y
+  id       = "x"
+}
+`
+	check(t, nil, src, `terraform {
+  required_providers {
+    google-beta = {
+      configuration_aliases = [google-beta.us-east]
+      source                = "hashicorp/google-beta"
+    }
+  }
+}
+
+provider "google-beta" {
+  alias      = "us-east"
+  my_setting = var.my_var
+}
+
+import {
+  id       = "x"
+  provider = google-beta
+  to       = google_x.my_y
+}
+
+module "my_mod" {
+  source = "./m"
+
+  providers = {
+    google-beta = google-beta.us-east
+  }
+}
+
+resource "google_x" "my_y" {
+  provider = google-beta.us-east
+
+  name = provider::google-beta::f(var.my_var)
+}
+`)
+	// With "provider" in Naming.Labels, they are renamed in all those places.
+	cfg := config.Default()
+	cfg.Naming.Labels["provider"] = 0
+	got := formatSource(t, cfg, "main.tf", map[string]string{"main.tf": src})
+	for _, want := range []string{"google_beta = {", "[google_beta.us_east]", `provider "google_beta"`, "google_beta = google_beta.us_east", "provider = google_beta.us_east", "provider = google_beta\n"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("with provider labels, no %q in:\n%s", want, got)
+		}
+	}
+
+	// ignore_naming on a .tfvars assignment keeps the names in the variable's
+	// declaration too, so its type still matches the value and the
+	// references (R3b-004).
+	files := map[string]string{
+		"main.tf": `variable "db-config" {
+  type = object({
+    instance-class = string
+  })
+  default = {
+    instance-class = "db.t3.micro"
+  }
+}
+
+output "o" {
+  value = var.db-config.instance-class
+}
+`,
+		"terraform.tfvars": `# terralint ignore_naming
+db-config = {
+  instance-class = "db.t3.small"
+}
+`,
+	}
+	want := `output "o" {
+  value = var.db-config.instance-class
+}
+
+variable "db-config" {
+  type = object({
+    instance-class = string
+  })
+
+  default = {
+    instance-class = "db.t3.micro"
+  }
+}
+`
+	if got := formatSource(t, config.Default(), "main.tf", files); got != want {
+		t.Errorf("main.tf:\n%s\nwant:\n%s", got, want)
+	}
+
+	// Without "output" in Naming.Labels, a read of a module call's output
+	// keeps the output's name, and the keys after it are renamed, as in the
+	// child's output value (R3b-005).
+	cfg = config.Default()
+	delete(cfg.Naming.Labels, "output")
+	check(t, cfg, `output "o-1" {
+  value = [
+    module.net.vpc-id,
+    module.net["a"].vpc-id,
+    module.net[each.key].subnet-ids.private-a,
+    module.net["a"].subnet-ids.private-a,
+    module.net.subnet-ids.private-a,
+    module.net[*].subnet-ids.private-a,
+    module.net["a"].subnet-ids[0].private-a,
+  ]
+}
+
+output "subnet-ids" {
+  value = {
+    private-a = "x"
+  }
+}
+`, `output "o-1" {
+  value = [
+    module.net.vpc-id,
+    module.net["a"].vpc-id,
+    module.net[each.key].subnet-ids.private_a,
+    module.net["a"].subnet-ids.private_a,
+    module.net.subnet-ids.private_a,
+    module.net[*].subnet-ids.private_a,
+    module.net["a"].subnet-ids[0].private_a,
+  ]
+}
+
+output "subnet-ids" {
+  value = {
+    private_a = "x"
+  }
+}
+`)
 }

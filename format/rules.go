@@ -1,6 +1,7 @@
 package format
 
 import (
+	"slices"
 	"sort"
 	"strings"
 
@@ -78,14 +79,19 @@ func (f *formatter) rename(top *plan) {
 	if f.cfg.Naming.Replace == "" {
 		return
 	}
-	f.renamePlan(top, nil)
+	f.renamePlan(top, nil, false)
 }
 
 // renamePlan renames in a body. kept holds the iterator names of the
-// dynamic blocks around it that keep their names.
-func (f *formatter) renamePlan(pl *plan, kept map[string]bool) {
+// dynamic blocks around it that keep their names; keep says the rule is off
+// for the whole body.
+func (f *formatter) renamePlan(pl *plan, kept map[string]bool, keep bool) {
+	providers := f.renames("provider")
 	for _, e := range pl.all() {
-		on := f.on(e.off, config.RuleNaming)
+		on := !keep && f.on(e.off, config.RuleNaming)
+		if !providers && providerPlace(pl, e.node) {
+			continue // provider local names: Terraform rejects "_" in them
+		}
 		switch n := e.node.(type) {
 		case *types.Attribute:
 			// The assignments of a .tfvars file and the arguments of a module
@@ -105,6 +111,11 @@ func (f *formatter) renamePlan(pl *plan, kept map[string]bool) {
 			}
 			f.renameExpr(n.Value, on, kept)
 		case *types.Block:
+			// A declaration exempt with its keys (by a .tfvars marker) keeps
+			// every name in it, as under a marker of its own.
+			_, deep := f.exempt.covers(declares(n))
+			deep = deep && pl.top
+			on = on && !deep
 			inner := kept
 			if on {
 				n.Type = f.name(n.Type)
@@ -126,9 +137,27 @@ func (f *formatter) renamePlan(pl *plan, kept map[string]bool) {
 					}
 				}
 			}
-			f.renamePlan(e.plan, inner)
+			f.renamePlan(e.plan, inner, keep || deep)
 		}
 	}
+}
+
+// providerPlace reports whether a body item holds only provider local
+// names: a required_providers block, the provider meta-argument of a
+// resource, data, ephemeral or import block, or a module call's providers.
+func providerPlace(pl *plan, n types.Body) bool {
+	switch n := n.(type) {
+	case *types.Block:
+		return n.Type == "required_providers"
+	case *types.Attribute:
+		switch n.Name {
+		case "provider":
+			return slices.Contains([]string{"resource", "data", "ephemeral", "import"}, pl.blockType)
+		case "providers":
+			return pl.blockType == "module" && pl.depth == 1
+		}
+	}
+	return false
 }
 
 // exempted reports whether an exemption covers the references that start
@@ -187,25 +216,26 @@ func (f *formatter) renameExpr(e types.Expression, on bool, kept map[string]bool
 		})
 	}
 	outputs := f.renames("output")
-	// renamed returns the names of ref that are renamed, parts[from:to],
-	// and whether the steps after it are. After module.<name> come the
-	// child module's outputs, which keep their names when outputs do.
-	renamed := func(ref *types.ReferenceExpr) (from, to int, steps bool) {
+	// renamed returns the names of ref that are renamed, parts[from:], and
+	// whether the steps after it are. After module.<name> comes the name of
+	// one of the child module's outputs, which keeps its name when outputs
+	// do (output): the third part, or else the first attribute step after
+	// the reference. What follows it reads the output's value, whose keys
+	// the child renames.
+	renamed := func(ref *types.ReferenceExpr) (from int, output, steps bool) {
 		switch {
 		case ref == nil:
-			return 0, 0, true
+			return 0, false, true
 		case kept[ref.Parts[0]] || len(ref.Parts) == 1 && f.exempt.names[ref.Parts[0]]:
-			return 0, 0, false
+			return len(ref.Parts), false, false
 		}
 		n, deep := f.exempt.covers(ref.Parts)
-		switch {
-		case deep:
-			return 0, 0, false
-		case ref.Parts[0] == "module" && !outputs:
-			return n, min(len(ref.Parts), 2), false
+		if deep {
+			return len(ref.Parts), false, false
 		}
-		return n, len(ref.Parts), true
+		return n, ref.Parts[0] == "module" && !outputs, true
 	}
+	first := map[types.Expression]bool{} // traversals whose first attribute step is an output's name
 	skip := map[types.Expression]bool{}
 	walk(e, func(x types.Expression) {
 		if skip[x] {
@@ -219,19 +249,26 @@ func (f *formatter) renameExpr(e types.Expression, on bool, kept map[string]bool
 				}
 			}
 		case *types.ReferenceExpr:
-			from, to, _ := renamed(x)
+			from, output, _ := renamed(x)
 			parts := append([]string{}, x.Parts...)
-			for i := from; i < to; i++ {
-				parts[i] = f.name(parts[i])
+			for i := from; i < len(parts); i++ {
+				if !output || i != 2 {
+					parts[i] = f.name(parts[i])
+				}
 			}
 			x.Parts = parts
 		case *types.RelativeTraversalExpr:
-			if _, _, steps := renamed(rootRef(x.Source)); steps {
-				f.renameSteps(x.Traversal)
+			_, output, steps := renamed(rootRef(x.Source))
+			first[x] = first[x] || output && !readsOutput(x.Source)
+			if steps {
+				f.renameSteps(x.Traversal, first[x])
 			}
 		case *types.SplatExpr:
-			if _, _, steps := renamed(rootRef(x.Source)); !steps {
+			_, output, steps := renamed(rootRef(x.Source))
+			if !steps {
 				walk(x.Each, func(y types.Expression) { skip[y] = true })
+			} else if each, ok := x.Each.(*types.RelativeTraversalExpr); ok && output && !readsOutput(x.Source) {
+				first[each] = true
 			}
 		case *types.ForArrayExpr:
 			if on {
@@ -245,12 +282,33 @@ func (f *formatter) renameExpr(e types.Expression, on bool, kept map[string]bool
 	})
 }
 
-func (f *formatter) renameSteps(steps []types.TraversalElem) {
+// renameSteps renames the attribute steps of a traversal, but the first one
+// when keepFirst.
+func (f *formatter) renameSteps(steps []types.TraversalElem, keepFirst bool) {
 	for i := range steps {
 		if steps[i].Type == "attr" {
-			steps[i].Name = f.name(steps[i].Name)
+			if !keepFirst {
+				steps[i].Name = f.name(steps[i].Name)
+			}
+			keepFirst = false
 		}
 	}
+}
+
+// readsOutput reports whether a chain that starts at module.<name> has an
+// attribute step after those two parts: the name of the output it reads.
+func readsOutput(e types.Expression) bool {
+	switch x := e.(type) {
+	case *types.ReferenceExpr:
+		return len(x.Parts) > 2
+	case *types.RelativeTraversalExpr:
+		return readsOutput(x.Source) || slices.ContainsFunc(x.Traversal, func(s types.TraversalElem) bool { return s.Type == "attr" })
+	case *types.IndexExpr:
+		return readsOutput(x.Collection)
+	case *types.SplatExpr:
+		return readsOutput(x.Source) || readsOutput(x.Each)
+	}
+	return false
 }
 
 // ---- Object keys ----
