@@ -13,7 +13,7 @@ package format_test
 //   - pass `terraform fmt -check` (when terraform is on PATH; required when
 //     $TERRALINT_REQUIRE_TERRAFORM is set).
 // With $TERRALINT_BIN set, TestFormatCLI runs check and apply over copies of
-// every repository. $TERRALINT_REPORT, when set, receives every problem.
+// every repository; files under a name starting with "." must be left alone. $TERRALINT_REPORT, when set, receives every problem.
 
 import (
 	"bytes"
@@ -962,7 +962,29 @@ func (c *ruleChecker) hasComment(r hcl.Range) bool {
 }
 
 func (c *ruleChecker) expr(e hclsyntax.Expression) {
+	// Inside a template interpolation, objects and lists print on one line
+	// (D10: terraform fmt dedents the body after a multi-line interpolation),
+	// so the layout rules do not apply there.
+	var templates []hcl.Range
 	hclsyntax.VisitAll(e, func(n hclsyntax.Node) hcl.Diagnostics {
+		switch n.(type) {
+		case *hclsyntax.TemplateExpr, *hclsyntax.TemplateWrapExpr:
+			templates = append(templates, n.Range())
+		}
+		return nil
+	})
+	inTemplate := func(r hcl.Range) bool {
+		for _, t := range templates {
+			if r.Start.Byte >= t.Start.Byte && r.End.Byte <= t.End.Byte {
+				return true
+			}
+		}
+		return false
+	}
+	hclsyntax.VisitAll(e, func(n hclsyntax.Node) hcl.Diagnostics {
+		if inTemplate(n.Range()) {
+			return nil
+		}
 		switch x := n.(type) {
 		case *hclsyntax.ObjectConsExpr:
 			c.object(x)
@@ -1113,6 +1135,7 @@ func checkRepoCLI(t *testing.T, bin, repo string, files []string, p *problems) {
 		src, want  []byte
 		valid      bool
 		needsApply bool
+		hidden     bool // under a name starting with ".", which directory mode skips (D11)
 	}
 	entries := make([]*entry, len(files))
 	for i, f := range files {
@@ -1128,7 +1151,11 @@ func checkRepoCLI(t *testing.T, bin, repo string, files []string, p *problems) {
 		if err := os.WriteFile(dst, src, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		entries[i] = &entry{copy: dst, src: src, valid: isValid(src, f)}
+		hidden := false
+		for _, part := range strings.Split(rel, string(filepath.Separator)) {
+			hidden = hidden || strings.HasPrefix(part, ".")
+		}
+		entries[i] = &entry{copy: dst, src: src, valid: isValid(src, f), hidden: hidden}
 	}
 	parallel(entries, func(e *entry) {
 		if !e.valid {
@@ -1157,6 +1184,12 @@ func checkRepoCLI(t *testing.T, bin, repo string, files []string, p *problems) {
 	code, out := runCLI(bin, "check", "-d", tmp)
 	clean := true
 	for _, e := range entries {
+		if e.hidden {
+			if strings.Contains(out, e.copy) {
+				p.add("%s: check -d named %s, which is under a name starting with \".\"", repo, e.copy)
+			}
+			continue
+		}
 		if !e.valid || e.needsApply {
 			clean = false
 			if !strings.Contains(out, e.copy) {
@@ -1171,7 +1204,7 @@ func checkRepoCLI(t *testing.T, bin, repo string, files []string, p *problems) {
 	// apply -d writes format.File's output and leaves invalid files alone.
 	allValid := true
 	for _, e := range entries {
-		allValid = allValid && e.valid
+		allValid = allValid && (e.valid || e.hidden)
 	}
 	for round := 1; round <= 2; round++ {
 		code, out := runCLI(bin, "apply", "-d", tmp)
@@ -1181,10 +1214,10 @@ func checkRepoCLI(t *testing.T, bin, repo string, files []string, p *problems) {
 		for _, e := range entries {
 			got, err := os.ReadFile(e.copy)
 			want := e.src
-			if e.valid {
+			if e.valid && !e.hidden {
 				want = e.want
 			}
-			if e.valid && e.want == nil {
+			if e.valid && !e.hidden && e.want == nil {
 				continue
 			}
 			if err != nil || !bytes.Equal(got, want) {
@@ -1197,7 +1230,7 @@ func checkRepoCLI(t *testing.T, bin, repo string, files []string, p *problems) {
 		p.add("%s: check -d after apply: exit %d, output %q", repo, code, trim(out))
 	}
 	for _, e := range entries {
-		if e.valid && strings.Contains(out, e.copy) {
+		if (e.valid || e.hidden) && strings.Contains(out, e.copy) {
 			p.add("%s: check -d after apply still names %s", repo, e.copy)
 		}
 	}
