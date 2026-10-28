@@ -212,7 +212,17 @@ func TestFormatCorpus(t *testing.T) {
 		}
 	})
 
-	checkTerraformFmt(t, mirror, &p)
+	fmtMirror := t.TempDir()
+	for _, r := range results {
+		dst := filepath.Join(fmtMirror, strings.TrimPrefix(r.root, mirror), r.rel)
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dst, plainLabels(r.out), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkTerraformFmt(t, fmtMirror, &p)
 	p.report(t, "format", checked)
 }
 
@@ -242,6 +252,32 @@ func checkTerraformFmt(t *testing.T, dir string, p *problems) {
 	} else if err != nil && !errors.As(err, &exitErr) {
 		p.add("terraform fmt: %v", err)
 	}
+}
+
+// plainLabels replaces % and $ in block labels with _, because terraform fmt
+// 1.9.7 deletes a label that does not lex as one quoted literal, as
+// `resource "a" "%[1]s" {}` does.
+func plainLabels(src []byte) []byte {
+	f, diags := hclsyntax.ParseConfig(src, "x.tf", hcl.InitialPos)
+	if diags.HasErrors() {
+		return src
+	}
+	out := append([]byte{}, src...)
+	var walk func(b *hclsyntax.Body)
+	walk = func(b *hclsyntax.Body) {
+		for _, blk := range b.Blocks {
+			for _, r := range blk.LabelRanges {
+				for i := r.Start.Byte; i < r.End.Byte; i++ {
+					if out[i] == '%' || out[i] == '$' {
+						out[i] = '_'
+					}
+				}
+			}
+			walk(blk.Body)
+		}
+	}
+	walk(f.Body.(*hclsyntax.Body))
+	return out
 }
 
 func firstDiff(a, b []byte) string {
@@ -324,8 +360,8 @@ func checkOutput(path string, src, out []byte) []string {
 	}
 
 	// Blank lines and the end of the file.
-	if bytes.Contains(out, []byte("\n\n\n")) {
-		fail("two blank lines in a row")
+	if line, ok := doubleBlank(outToks); ok {
+		fail("line %d: two blank lines in a row", line)
 	}
 	if len(out) > 0 && (!bytes.HasSuffix(out, []byte("\n")) || bytes.HasSuffix(out, []byte("\n\n")) || out[0] == '\n') {
 		fail("output must not start with a blank line and must end with exactly one newline")
@@ -334,6 +370,28 @@ func checkOutput(path string, src, out []byte) []string {
 	c := &ruleChecker{out: out, toks: outToks}
 	c.body(outFile.Body.(*hclsyntax.Body), "root", true)
 	return append(ps, c.problems...)
+}
+
+// doubleBlank finds two blank lines in a row outside heredoc and string text.
+// A line comment's token carries its own newline.
+func doubleBlank(toks hclsyntax.Tokens) (int, bool) {
+	run := 0
+	for _, tok := range toks {
+		switch {
+		case tok.Type == hclsyntax.TokenNewline:
+			run++
+		case tok.Type == hclsyntax.TokenComment && bytes.HasSuffix(tok.Bytes, []byte("\n")):
+			run = 1
+			continue
+		default:
+			run = 0
+			continue
+		}
+		if run >= 3 {
+			return tok.Range.Start.Line, true
+		}
+	}
+	return 0, false
 }
 
 // ---- Meaning: a canonical dump with the intended changes applied. ----
@@ -360,11 +418,48 @@ func effectiveType(b *hclsyntax.Block) string {
 }
 
 func dumpBody(b *hclsyntax.Body, top bool) (string, error) {
+	return dumpBodyOf(b, top, "")
+}
+
+// legacyType gives the dump of the type expression `terraform fmt` rewrites a
+// pre-0.12 variable type to (terraform's testdata/fmt/variable_type_out.tf):
+// "string" to string, "list"/"map" to list(string)/map(string), and bare
+// list/map/set to list(any)/map(any)/set(any).
+func legacyType(e hclsyntax.Expression) (string, bool) {
+	switch x := e.(type) {
+	case *hclsyntax.ScopeTraversalExpr:
+		if len(x.Traversal) == 1 {
+			switch word := x.Traversal.RootName(); word {
+			case "list", "map", "set":
+				return "call(" + word + ", expand=false, trav(any))", true
+			}
+		}
+	case *hclsyntax.TemplateExpr:
+		if len(x.Parts) == 1 {
+			if l, ok := x.Parts[0].(*hclsyntax.LiteralValueExpr); ok && l.Val.Type() == cty.String {
+				switch word := l.Val.AsString(); word {
+				case "string":
+					return "trav(string)", true
+				case "list", "map":
+					return "call(" + word + ", expand=false, trav(string))", true
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+func dumpBodyOf(b *hclsyntax.Body, top bool, blockType string) (string, error) {
 	var attrs []string
 	for name, a := range b.Attributes {
 		v, err := dumpExpr(a.Expr)
 		if err != nil {
 			return "", err
+		}
+		if blockType == "variable" && name == "type" {
+			if t, ok := legacyType(a.Expr); ok {
+				v = t
+			}
 		}
 		attrs = append(attrs, ren(name)+" = "+v)
 	}
@@ -381,7 +476,11 @@ func dumpBody(b *hclsyntax.Body, top bool) (string, error) {
 			}
 			continue
 		}
-		inner, err := dumpBody(nb.Body, false)
+		typ := ""
+		if top {
+			typ = nb.Type
+		}
+		inner, err := dumpBodyOf(nb.Body, false, typ)
 		if err != nil {
 			return "", err
 		}

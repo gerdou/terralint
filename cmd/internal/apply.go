@@ -6,12 +6,15 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+
+	"github.com/gerdou/terralint/config"
+	"github.com/gerdou/terralint/format"
 )
 
 // Apply rewrites every file under path to follow the rules.
 func Apply(path string) error {
 	return forEachFile(path, func(filePath string) error {
-		formattedBytes, err := getFormattedContent(filePath)
+		formattedBytes, err := format.File(filePath, config.Default())
 		if err != nil {
 			return err
 		}

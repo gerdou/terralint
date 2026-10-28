@@ -10,8 +10,21 @@ type Expression interface {
 	Range() hcl.Range
 }
 
+// ExprComments are the comments attached to an expression that is part of
+// a larger one, other than those the enclosing item, object item or list
+// holds. Every expression type embeds it.
+type ExprComments struct {
+	LeadComment string // The comments between the previous part of the enclosing expression and this one, one per line
+	TailComment string // The comments after this expression on the line it ends, one per line
+}
+
+// Comments returns the expression's comments, for code that handles every
+// expression type alike.
+func (c *ExprComments) Comments() *ExprComments { return c }
+
 // LiteralValue represents primitive values (string, number, bool, null)
 type LiteralValue struct {
+	ExprComments
 	Value     interface{} // string, bool, int64 (whole numbers), float64 (other numbers), or nil for null
 	ValueType string      // "string", "number", "bool" or "null"
 	ExprRange hcl.Range
@@ -27,8 +40,10 @@ func (l *LiteralValue) Range() hcl.Range {
 
 // ObjectExpr represents object/map expressions
 type ObjectExpr struct {
-	Items     []ObjectItem
-	ExprRange hcl.Range
+	ExprComments
+	Items      []ObjectItem
+	EndComment string // The comments after the last item (or the opening brace, when there is none), on their own lines, one per line
+	ExprRange  hcl.Range
 }
 
 type ObjectItem struct {
@@ -36,6 +51,7 @@ type ObjectItem struct {
 	Value         Expression
 	InlineComment string // The first comment on the item's first line, after its start and before the next item or the closing brace
 	BlockComment  string // The comments on the lines between the previous item (or the opening brace) and this one, one per line
+	TrailComment  string // The comments after the item on its last line, besides InlineComment
 	ExprRange     hcl.Range
 }
 
@@ -57,8 +73,10 @@ func (o *ObjectExpr) Range() hcl.Range {
 
 // ArrayExpr represents array/list expressions
 type ArrayExpr struct {
-	Items     []Expression
-	ExprRange hcl.Range
+	ExprComments
+	Items      []Expression
+	EndComment string // The comments after the last element (or the opening bracket, when there is none), on their own lines, one per line
+	ExprRange  hcl.Range
 }
 
 func (a *ArrayExpr) ExpressionType() string {
@@ -71,6 +89,7 @@ func (a *ArrayExpr) Range() hcl.Range {
 
 // ReferenceExpr represents variable references and attribute access
 type ReferenceExpr struct {
+	ExprComments
 	Parts     []string // e.g., ["var", "environment"] for var.environment
 	ExprRange hcl.Range
 }
@@ -85,9 +104,11 @@ func (r *ReferenceExpr) Range() hcl.Range {
 
 // FunctionCallExpr represents function calls
 type FunctionCallExpr struct {
+	ExprComments
 	Name        string // The full name, including any namespace (e.g. "provider::aws::arn_parse")
 	Args        []Expression
-	ExpandFinal bool // The last argument ends in "..." and its elements are passed as separate arguments
+	ExpandFinal bool   // The last argument ends in "..." and its elements are passed as separate arguments
+	EndComment  string // The comments after the last argument (or the opening parenthesis, when there is none), on their own lines, one per line
 	ExprRange   hcl.Range
 }
 
@@ -101,6 +122,7 @@ func (f *FunctionCallExpr) Range() hcl.Range {
 
 // TemplateExpr represents string interpolation
 type TemplateExpr struct {
+	ExprComments
 	Parts     []Expression // String LiteralValues and interpolated expressions. A %{if} directive is a ConditionalExpr and a %{for} directive a TemplateExpr holding one ForArrayExpr; each branch and loop body is a string LiteralValue when it is plain text ("" when empty or absent), otherwise a TemplateExpr
 	ExprRange hcl.Range
 }
@@ -115,6 +137,7 @@ func (t *TemplateExpr) Range() hcl.Range {
 
 // ConditionalExpr represents conditional expressions (condition ? true_val : false_val)
 type ConditionalExpr struct {
+	ExprComments
 	Condition Expression
 	TrueExpr  Expression
 	FalseExpr Expression
@@ -131,6 +154,7 @@ func (c *ConditionalExpr) Range() hcl.Range {
 
 // BinaryExpr represents binary operations
 type BinaryExpr struct {
+	ExprComments
 	Left      Expression
 	Operator  string // Should support: ==, !=, <, >, <=, >=, &&, ||, +, -, *, /, %, etc.
 	Right     Expression
@@ -147,6 +171,7 @@ func (b *BinaryExpr) Range() hcl.Range {
 
 // ForMapExpr represents for expressions that build an object: {for k, v in map : k => v}
 type ForMapExpr struct {
+	ExprComments
 	// Iterator variables
 	ValueVar string // The value variable ("v" in "for k, v in map", "x" in "for x in xs")
 	KeyVar   string // The key variable ("k" in "for k, v in map"), empty when only one variable is given
@@ -176,6 +201,7 @@ func (f *ForMapExpr) Range() hcl.Range {
 
 // ForArrayExpr represents for expressions that build a tuple: [for x in xs : upper(x)]
 type ForArrayExpr struct {
+	ExprComments
 	// Iterator variables
 	ValueVar string // The value variable ("x" in "for x in xs", "v" in "for i, v in xs")
 	KeyVar   string // The key or index variable ("i" in "for i, v in xs"), empty when only one variable is given
@@ -203,6 +229,7 @@ func (f *ForArrayExpr) Range() hcl.Range {
 
 // SplatExpr represents splat expressions: aws_instance.server[*].id
 type SplatExpr struct {
+	ExprComments
 	Source    Expression // Expression being splattered ("aws_instance.server")
 	Each      Expression // Expression to evaluate for each element, in which a SplatItemExpr stands for the element (".id")
 	ExprRange hcl.Range
@@ -220,6 +247,7 @@ func (s *SplatExpr) Range() hcl.Range {
 // x[*].id, Each is a RelativeTraversalExpr whose Source is a SplatItemExpr,
 // and in x[*], Each is the SplatItemExpr itself.
 type SplatItemExpr struct {
+	ExprComments
 	ExprRange hcl.Range
 }
 
@@ -233,6 +261,7 @@ func (s *SplatItemExpr) Range() hcl.Range {
 
 // HeredocExpr represents heredoc strings
 type HeredocExpr struct {
+	ExprComments
 	Marker    string       // The heredoc marker (e.g., "EOT")
 	Content   string       // The lines between the marker lines as written, without the last newline; for <<- the indentation they share is removed
 	Indented  bool         // Whether it's an indented heredoc (<<-)
@@ -252,6 +281,7 @@ func (h *HeredocExpr) Range() hcl.Range {
 // x[count.index] or x[-1]. A literal key, as in list[0], map["key"] or
 // each.value["name"], is an "index" step of a RelativeTraversalExpr instead.
 type IndexExpr struct {
+	ExprComments
 	Collection Expression
 	Key        Expression
 	ExprRange  hcl.Range
@@ -267,6 +297,7 @@ func (i *IndexExpr) Range() hcl.Range {
 
 // ParenExpr represents parenthesized expressions
 type ParenExpr struct {
+	ExprComments
 	Expression Expression
 	ExprRange  hcl.Range
 }
@@ -281,6 +312,7 @@ func (p *ParenExpr) Range() hcl.Range {
 
 // UnaryExpr represents unary operations
 type UnaryExpr struct {
+	ExprComments
 	Operator  string
 	Expr      Expression
 	ExprRange hcl.Range
@@ -299,6 +331,7 @@ func (u *UnaryExpr) Range() hcl.Range {
 // (Source is the ReferenceExpr aws_instance.x, then [0] and .id). A name
 // followed by attribute steps only, like var.a.b, is a ReferenceExpr.
 type RelativeTraversalExpr struct {
+	ExprComments
 	Source    Expression
 	Traversal []TraversalElem
 	ExprRange hcl.Range

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gerdou/terralint/config"
+	"github.com/gerdou/terralint/format"
 	"github.com/sergi/go-diff/diffmatchpatch"
 )
 
@@ -19,7 +21,7 @@ func Check(path string) error {
 		if err != nil {
 			return err
 		}
-		formatted, err := getFormattedContent(filePath)
+		formatted, err := format.File(filePath, config.Default())
 		if err != nil {
 			return err
 		}
@@ -60,9 +62,7 @@ func compareContent(original []byte, formatted []byte) error {
 	src := string(original)
 	dst := string(formatted)
 
-	wSrc, wDst, warray := dmp.DiffLinesToRunes(src, dst)
-	diffs := dmp.DiffMainRunes(wSrc, wDst, false)
-	diffs = dmp.DiffCharsToLines(diffs, warray)
+	diffs := lineDiff(dmp, src, dst)
 
 	var notEquals []diffmatchpatch.Diff
 	for _, diff := range diffs {
@@ -79,4 +79,51 @@ func compareContent(original []byte, formatted []byte) error {
 	errorText.WriteString("\n")
 	errorText.WriteString(dmp.DiffPrettyText(diffs))
 	return errors.New(errorText.String())
+}
+
+// lineDiff diffs a and b line by line. Each distinct line stands for one
+// private-use rune while diffing: go-diff's own DiffLinesToRunes encodes
+// line numbers as digit strings and so diffs digits, not lines.
+func lineDiff(dmp *diffmatchpatch.DiffMatchPatch, a, b string) []diffmatchpatch.Diff {
+	index := map[string]rune{}
+	var lines []string
+	toRunes := func(s string) []rune {
+		var rs []rune
+		for _, line := range strings.SplitAfter(s, "\n") {
+			if line == "" {
+				continue
+			}
+			r, ok := index[line]
+			if !ok {
+				r = lineRune(len(lines))
+				index[line] = r
+				lines = append(lines, line)
+			}
+			rs = append(rs, r)
+		}
+		return rs
+	}
+	ra, rb := toRunes(a), toRunes(b)
+	byRune := make(map[rune]string, len(index))
+	for line, r := range index {
+		byRune[r] = line
+	}
+	diffs := dmp.DiffMainRunes(ra, rb, false)
+	for i := range diffs {
+		var text strings.Builder
+		for _, r := range diffs[i].Text {
+			text.WriteString(byRune[r])
+		}
+		diffs[i].Text = text.String()
+	}
+	return diffs
+}
+
+// lineRune maps a line number to a rune in the private-use areas, which
+// hold 137,468 of them.
+func lineRune(i int) rune {
+	if i < 0x1900 {
+		return rune(0xE000 + i)
+	}
+	return rune(0xF0000 + i - 0x1900)
 }
