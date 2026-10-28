@@ -12,19 +12,14 @@ package parser
 //   - leading and inline comments of blocks, attributes and object items are
 //     captured where the comment rules below put them.
 //
-// With $TERRALINT_BIN set to a built terralint binary, TestCorpusCLI runs the
-// CLI over every repository (each subdirectory of a corpus root).
+// The CLI is checked over the corpus by format/corpus_format_test.go.
 // $TERRALINT_REPORT, when set, receives the full list of problems, and
 // $TERRALINT_INVALID_LIST the files HCL rejects.
 
 import (
-	"bytes"
-	"context"
-	"errors"
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -674,176 +669,4 @@ func dumpKey(e hclsyntax.Expression, objs *[]*hclsyntax.ObjectConsExpr) (string,
 	}
 	s, err := dumpExpr(k.Wrapped, objs)
 	return "key(" + s + ")", err
-}
-
-// TestCorpusCLI runs the terralint binary over each repository in the corpus.
-// Until linter rules exist, a valid file has nothing to report or change.
-func TestCorpusCLI(t *testing.T) {
-	bin := os.Getenv("TERRALINT_BIN")
-	if bin == "" {
-		t.Skip("TERRALINT_BIN not set")
-	}
-	var repos []string
-	for _, root := range corpusRoots() {
-		entries, err := os.ReadDir(root)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, e := range entries {
-			if e.IsDir() && e.Name() != ".git" {
-				repos = append(repos, filepath.Join(root, e.Name()))
-			}
-		}
-	}
-
-	var mu sync.Mutex
-	var problems []string
-	checked := 0
-	add := func(ps ...string) {
-		mu.Lock()
-		problems = append(problems, ps...)
-		mu.Unlock()
-	}
-	for _, repo := range repos {
-		files := corpusFiles(t, repo)
-		if len(files) == 0 {
-			continue
-		}
-		checked += len(files)
-		validity := map[string]bool{}
-		for _, f := range files {
-			content, err := os.ReadFile(f)
-			if err != nil {
-				t.Fatal(err)
-			}
-			_, diags := hclsyntax.ParseConfig(content, f, hcl.InitialPos)
-			validity[f] = !diags.HasErrors()
-		}
-
-		runParallel(files, func(f string) {
-			add(checkCLIFile(bin, f, validity[f])...)
-		})
-		add(checkCLIRepo(t, bin, repo, files, validity)...)
-	}
-	reportProblems(t, "cli", checked, problems)
-}
-
-type cliRun struct {
-	code           int
-	stdout, stderr string
-	took           time.Duration
-}
-
-func runCLI(bin string, args ...string) cliRun {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, args...)
-	var out, errb bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &errb
-	start := time.Now()
-	err := cmd.Run()
-	r := cliRun{stdout: out.String(), stderr: errb.String(), took: time.Since(start)}
-	var exitErr *exec.ExitError
-	if ctx.Err() != nil {
-		r.code = -1
-		r.stderr += "timed out after 5m"
-	} else if errors.As(err, &exitErr) {
-		r.code = exitErr.ExitCode()
-	} else if err != nil {
-		r.code = -1
-		r.stderr += err.Error()
-	}
-	return r
-}
-
-func panicked(r cliRun) bool {
-	return strings.Contains(r.stderr, "panic:") || strings.Contains(r.stderr, "goroutine ")
-}
-
-func checkCLIFile(bin, f string, valid bool) []string {
-	var ps []string
-	r := runCLI(bin, "check", "-f", f)
-	switch {
-	case panicked(r):
-		ps = append(ps, fmt.Sprintf("%s: check -f panicked: %s", f, r.stderr))
-	case valid && (r.code != 0 || r.stdout != "" || r.stderr != ""):
-		ps = append(ps, fmt.Sprintf("%s: check -f on a valid file: exit %d, stdout %q, stderr %q", f, r.code, trim(r.stdout), trim(r.stderr)))
-	case !valid && (r.code == 0 || !strings.Contains(r.stdout+r.stderr, filepath.Base(f))):
-		ps = append(ps, fmt.Sprintf("%s: check -f on an invalid file: exit %d, output does not name the file or exit is 0: %q", f, r.code, trim(r.stdout+r.stderr)))
-	}
-	if r.took > 5*time.Second {
-		ps = append(ps, fmt.Sprintf("%s: check -f took %s", f, r.took))
-	}
-	return ps
-}
-
-func checkCLIRepo(t *testing.T, bin, repo string, files []string, validity map[string]bool) []string {
-	var ps []string
-	allValid := true
-	for _, f := range files {
-		allValid = allValid && validity[f]
-	}
-
-	r := runCLI(bin, "check", "-d", repo)
-	out := r.stdout + r.stderr
-	switch {
-	case panicked(r):
-		ps = append(ps, fmt.Sprintf("%s: check -d panicked: %s", repo, trim(r.stderr)))
-	case allValid && (r.code != 0 || r.stdout != "" || r.stderr != ""):
-		ps = append(ps, fmt.Sprintf("%s: check -d on valid files: exit %d, stdout %q, stderr %q", repo, r.code, trim(r.stdout), trim(r.stderr)))
-	case !allValid && r.code == 0:
-		ps = append(ps, fmt.Sprintf("%s: check -d exit 0 with invalid files", repo))
-	}
-	if !allValid {
-		for _, f := range files {
-			if !validity[f] && !strings.Contains(out, filepath.Base(f)) {
-				ps = append(ps, fmt.Sprintf("%s: check -d did not report invalid file %s", repo, f))
-			}
-		}
-	}
-
-	// apply works on a copy; nothing may change.
-	tmp := t.TempDir()
-	originals := map[string][]byte{}
-	for _, f := range files {
-		rel, _ := filepath.Rel(repo, f)
-		dst := filepath.Join(tmp, rel)
-		content, err := os.ReadFile(f)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(dst, content, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		originals[dst] = content
-	}
-	r = runCLI(bin, "apply", "-d", tmp)
-	switch {
-	case panicked(r):
-		ps = append(ps, fmt.Sprintf("%s: apply -d panicked: %s", repo, trim(r.stderr)))
-	case allValid && (r.code != 0 || r.stderr != ""):
-		ps = append(ps, fmt.Sprintf("%s: apply -d on valid files: exit %d, stderr %q", repo, r.code, trim(r.stderr)))
-	case !allValid && r.code == 0:
-		ps = append(ps, fmt.Sprintf("%s: apply -d exit 0 with invalid files", repo))
-	}
-	if r.took > 60*time.Second {
-		ps = append(ps, fmt.Sprintf("%s: apply -d took %s", repo, r.took))
-	}
-	for dst, want := range originals {
-		got, err := os.ReadFile(dst)
-		if err != nil || !bytes.Equal(got, want) {
-			ps = append(ps, fmt.Sprintf("%s: apply -d changed %s", repo, dst))
-		}
-	}
-	return ps
-}
-
-func trim(s string) string {
-	if len(s) > 300 {
-		return s[:300] + "..."
-	}
-	return s
 }
