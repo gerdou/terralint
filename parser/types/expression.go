@@ -101,7 +101,7 @@ func (f *FunctionCallExpr) Range() hcl.Range {
 
 // TemplateExpr represents string interpolation
 type TemplateExpr struct {
-	Parts     []Expression // String LiteralValues and interpolated expressions. A %{if} directive is a ConditionalExpr whose results are templates; a %{for} directive is a TemplateExpr holding one ForArrayExpr
+	Parts     []Expression // String LiteralValues and interpolated expressions. A %{if} directive is a ConditionalExpr and a %{for} directive a TemplateExpr holding one ForArrayExpr; each branch and loop body is a string LiteralValue when it is plain text ("" when empty or absent), otherwise a TemplateExpr
 	ExprRange hcl.Range
 }
 
@@ -248,7 +248,9 @@ func (h *HeredocExpr) Range() hcl.Range {
 	return h.ExprRange
 }
 
-// IndexExpr represents index access operations: list[0], map["key"]
+// IndexExpr is index access whose key is not a literal: local.m[var.k],
+// x[count.index] or x[-1]. A literal key, as in list[0], map["key"] or
+// each.value["name"], is an "index" step of a RelativeTraversalExpr instead.
 type IndexExpr struct {
 	Collection Expression
 	Key        Expression
