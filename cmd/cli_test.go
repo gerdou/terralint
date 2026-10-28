@@ -72,6 +72,11 @@ func TestCLI(t *testing.T) {
 	write(t, filepath.Join(mixed, "bad.tf"), invalidTF)
 	write(t, filepath.Join(mixed, "s1", "s2", "s3", "bad2.tf"), invalidTF)
 	write(t, filepath.Join(dir, "notes.txt"), "x\n")
+	// A directory named through a link is checked like the directory itself.
+	mixedLink := filepath.Join(dir, "mixed-link")
+	if err := os.Symlink(mixed, mixedLink); err != nil {
+		t.Fatal(err)
+	}
 
 	tests := []struct {
 		args       []string
@@ -93,6 +98,10 @@ func TestCLI(t *testing.T) {
 		{args: []string{"check", "-d", filepath.Join(valid, "ok.tf")}, code: 1, inStderr: []string{"expected a directory path"}, usageShown: true},
 		{args: []string{"check"}, code: 1, inStderr: []string{"exactly one of the command flags"}, usageShown: true},
 		{args: []string{"-f", filepath.Join(mixed, "bad.tf")}, code: 1, inStderr: []string{"need a command"}, usageShown: true},
+		{args: []string{"check", "-d", mixedLink}, code: 1, inStderr: []string{"mixed-link/bad.tf:", "bad2.tf:"}},
+		{args: []string{"apply", "-d", mixedLink}, code: 1, inStderr: []string{"mixed-link/bad.tf:", "bad2.tf:"}},
+		{args: []string{"check", "-f", filepath.Join(mixed, "bad.tf"), "-f", filepath.Join(valid, "ok.tf")}, code: 1, inStderr: []string{"more than once"}, usageShown: true},
+		{args: []string{"apply", "-d", mixed, "-d", valid}, code: 1, inStderr: []string{"more than once"}, usageShown: true},
 	}
 	for _, tt := range tests {
 		code, stdout, stderr := runCLI(t, tt.args...)

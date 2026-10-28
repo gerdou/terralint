@@ -50,7 +50,7 @@ func createComplexModuleExpected() types.Body {
 										Name: "cidrsubnet",
 										Args: []types.Expression{
 											&types.ReferenceExpr{Parts: []string{"var", "base_cidr_block"}},
-											&types.LiteralValue{Value: 4, ValueType: "number"},
+											&types.LiteralValue{Value: int64(4), ValueType: "number"},
 											&types.ReferenceExpr{Parts: []string{"var", "vpc_index"}},
 										},
 									},
@@ -120,10 +120,10 @@ func createComplexModuleExpected() types.Body {
 																			Key: &types.ReferenceExpr{Parts: []string{"list"}},
 																			Value: &types.ArrayExpr{
 																				Items: []types.Expression{
-																					&types.LiteralValue{Value: 1, ValueType: "number"},
-																					&types.LiteralValue{Value: 2, ValueType: "number"},
-																					&types.LiteralValue{Value: 3, ValueType: "number"},
-																					&types.LiteralValue{Value: 4, ValueType: "number"},
+																					&types.LiteralValue{Value: int64(1), ValueType: "number"},
+																					&types.LiteralValue{Value: int64(2), ValueType: "number"},
+																					&types.LiteralValue{Value: int64(3), ValueType: "number"},
+																					&types.LiteralValue{Value: int64(4), ValueType: "number"},
 																				},
 																			},
 																		},
@@ -137,7 +137,7 @@ func createComplexModuleExpected() types.Body {
 																					},
 																					{
 																						Key:   &types.ReferenceExpr{Parts: []string{"key2"}},
-																						Value: &types.LiteralValue{Value: 42, ValueType: "number"},
+																						Value: &types.LiteralValue{Value: int64(42), ValueType: "number"},
 																					},
 																				},
 																			},
@@ -175,11 +175,11 @@ func createComplexModuleExpected() types.Body {
 								Name: "cidrsubnet",
 								Args: []types.Expression{
 									&types.ReferenceExpr{Parts: []string{"var", "base_cidr_block"}},
-									&types.LiteralValue{Value: 8, ValueType: "number"},
+									&types.LiteralValue{Value: int64(8), ValueType: "number"},
 									&types.BinaryExpr{
 										Left:     &types.ReferenceExpr{Parts: []string{"i"}},
 										Operator: "+",
-										Right:    &types.LiteralValue{Value: 10, ValueType: "number"},
+										Right:    &types.LiteralValue{Value: int64(10), ValueType: "number"},
 									},
 								},
 							},
@@ -314,6 +314,67 @@ func createComplexModuleExpected() types.Body {
 							Marker:   "EOT",
 							Indented: true,
 							Content:  "#!/bin/bash\necho \"Environment: ${var.environment}\"\necho \"Region: ${data.aws_region.current.name}\"\n\n# Complex interpolation\n${join(\"\\n\", [\n  for script in var.bootstrap_scripts :\n  \"source ${script}\"\n])}\n\n# Conditional section\n${var.install_monitoring ? \"setup_monitoring ${var.monitoring_endpoint}\" : \"echo 'Monitoring disabled'\"}\n\n# For loop in heredoc\n%{for pkg in var.packages~}\nyum install -y ${pkg}\n%{endfor~}\n\n# If directive in heredoc\n%{if var.environment == \"prod\"~}\necho \"Production environment detected, applying strict security\"\n%{else~}\necho \"Non-production environment, using standard security\"\n%{endif~}",
+							Parts: []types.Expression{
+								&types.LiteralValue{Value: "#!/bin/bash\necho \"Environment: ", ValueType: "string"},
+								&types.ReferenceExpr{Parts: []string{"var", "environment"}},
+								&types.LiteralValue{Value: "\"\necho \"Region: ", ValueType: "string"},
+								&types.ReferenceExpr{Parts: []string{"data", "aws_region", "current", "name"}},
+								&types.LiteralValue{Value: "\"\n    \n# Complex interpolation\n", ValueType: "string"},
+								&types.FunctionCallExpr{
+									Name: "join",
+									Args: []types.Expression{
+										&types.LiteralValue{Value: "\n", ValueType: "string"},
+										&types.ForArrayExpr{
+											ValueVar:   "script",
+											Collection: &types.ReferenceExpr{Parts: []string{"var", "bootstrap_scripts"}},
+											ThenValueExpr: &types.TemplateExpr{
+												Parts: []types.Expression{
+													&types.LiteralValue{Value: "source ", ValueType: "string"},
+													&types.ReferenceExpr{Parts: []string{"script"}},
+												},
+											},
+										},
+									},
+								},
+								&types.LiteralValue{Value: "\n    \n# Conditional section\n", ValueType: "string"},
+								&types.ConditionalExpr{
+									Condition: &types.ReferenceExpr{Parts: []string{"var", "install_monitoring"}},
+									TrueExpr: &types.TemplateExpr{
+										Parts: []types.Expression{
+											&types.LiteralValue{Value: "setup_monitoring ", ValueType: "string"},
+											&types.ReferenceExpr{Parts: []string{"var", "monitoring_endpoint"}},
+										},
+									},
+									FalseExpr: &types.LiteralValue{Value: "echo 'Monitoring disabled'", ValueType: "string"},
+								},
+								&types.LiteralValue{Value: "\n    \n# For loop in heredoc\n", ValueType: "string"},
+								&types.TemplateExpr{
+									Parts: []types.Expression{
+										&types.ForArrayExpr{
+											ValueVar:   "pkg",
+											Collection: &types.ReferenceExpr{Parts: []string{"var", "packages"}},
+											ThenValueExpr: &types.TemplateExpr{
+												Parts: []types.Expression{
+													&types.LiteralValue{Value: "    yum install -y ", ValueType: "string"},
+													&types.ReferenceExpr{Parts: []string{"pkg"}},
+													&types.LiteralValue{Value: "\n", ValueType: "string"},
+												},
+											},
+										},
+									},
+								},
+								&types.LiteralValue{Value: "    \n# If directive in heredoc\n", ValueType: "string"},
+								&types.ConditionalExpr{
+									Condition: &types.BinaryExpr{
+										Left:     &types.ReferenceExpr{Parts: []string{"var", "environment"}},
+										Operator: "==",
+										Right:    &types.LiteralValue{Value: "prod", ValueType: "string"},
+									},
+									TrueExpr:  &types.LiteralValue{Value: "    echo \"Production environment detected, applying strict security\"\n", ValueType: "string"},
+									FalseExpr: &types.LiteralValue{Value: "    echo \"Non-production environment, using standard security\"\n", ValueType: "string"},
+								},
+								&types.LiteralValue{Value: "", ValueType: "string"},
+							},
 						},
 					},
 					&types.Attribute{
@@ -327,22 +388,22 @@ func createComplexModuleExpected() types.Body {
 										Operator: "==",
 										Right:    &types.LiteralValue{Value: "prod", ValueType: "string"},
 									},
-									TrueExpr: &types.LiteralValue{Value: 300, ValueType: "number"},
+									TrueExpr: &types.LiteralValue{Value: int64(300), ValueType: "number"},
 									FalseExpr: &types.ConditionalExpr{
 										Condition: &types.BinaryExpr{
 											Left:     &types.ReferenceExpr{Parts: []string{"var", "environment"}},
 											Operator: "==",
 											Right:    &types.LiteralValue{Value: "staging", ValueType: "string"},
 										},
-										TrueExpr: &types.LiteralValue{Value: 180, ValueType: "number"},
+										TrueExpr: &types.LiteralValue{Value: int64(180), ValueType: "number"},
 										FalseExpr: &types.ConditionalExpr{
 											Condition: &types.BinaryExpr{
 												Left:     &types.ReferenceExpr{Parts: []string{"var", "environment"}},
 												Operator: "==",
 												Right:    &types.LiteralValue{Value: "dev", ValueType: "string"},
 											},
-											TrueExpr:  &types.LiteralValue{Value: 60, ValueType: "number"},
-											FalseExpr: &types.LiteralValue{Value: 30, ValueType: "number"},
+											TrueExpr:  &types.LiteralValue{Value: int64(60), ValueType: "number"},
+											FalseExpr: &types.LiteralValue{Value: int64(30), ValueType: "number"},
 										},
 									},
 								},
@@ -356,7 +417,7 @@ func createComplexModuleExpected() types.Body {
 										Right:    &types.LiteralValue{Value: nil, ValueType: "null"},
 									},
 									TrueExpr:  &types.ReferenceExpr{Parts: []string{"var", "additional_timeout"}},
-									FalseExpr: &types.LiteralValue{Value: 0, ValueType: "number"},
+									FalseExpr: &types.LiteralValue{Value: int64(0), ValueType: "number"},
 								},
 							},
 						},
@@ -373,7 +434,7 @@ func createComplexModuleExpected() types.Body {
 											Operator: "*",
 											Right: &types.ParenExpr{
 												Expression: &types.BinaryExpr{
-													Left:     &types.LiteralValue{Value: 1, ValueType: "number"},
+													Left:     &types.LiteralValue{Value: int64(1), ValueType: "number"},
 													Operator: "+",
 													Right:    &types.ReferenceExpr{Parts: []string{"var", "multiplier"}},
 												},
@@ -386,10 +447,10 @@ func createComplexModuleExpected() types.Body {
 											Condition: &types.BinaryExpr{
 												Left:     &types.ReferenceExpr{Parts: []string{"var", "divisor"}},
 												Operator: ">",
-												Right:    &types.LiteralValue{Value: 0, ValueType: "number"},
+												Right:    &types.LiteralValue{Value: int64(0), ValueType: "number"},
 											},
 											TrueExpr:  &types.ReferenceExpr{Parts: []string{"var", "divisor"}},
-											FalseExpr: &types.LiteralValue{Value: 1, ValueType: "number"},
+											FalseExpr: &types.LiteralValue{Value: int64(1), ValueType: "number"},
 										},
 									},
 								},
@@ -408,7 +469,7 @@ func createComplexModuleExpected() types.Body {
 											Operator: "*",
 											Right: &types.ParenExpr{
 												Expression: &types.BinaryExpr{
-													Left:     &types.LiteralValue{Value: 1, ValueType: "number"},
+													Left:     &types.LiteralValue{Value: int64(1), ValueType: "number"},
 													Operator: "+",
 													Right:    &types.ReferenceExpr{Parts: []string{"var", "prod_factor"}},
 												},
@@ -421,7 +482,7 @@ func createComplexModuleExpected() types.Body {
 											Operator: "*",
 											Right: &types.ParenExpr{
 												Expression: &types.BinaryExpr{
-													Left:     &types.LiteralValue{Value: 1, ValueType: "number"},
+													Left:     &types.LiteralValue{Value: int64(1), ValueType: "number"},
 													Operator: "-",
 													Right:    &types.ReferenceExpr{Parts: []string{"var", "non_prod_factor"}},
 												},
@@ -446,22 +507,22 @@ func createComplexModuleExpected() types.Body {
 												&types.ConditionalExpr{
 													Condition: &types.ReferenceExpr{Parts: []string{"var", "create_default_security_group"}},
 													TrueExpr: &types.RelativeTraversalExpr{
-														Source: &types.IndexExpr{
-															Collection: &types.ReferenceExpr{Parts: []string{"aws_security_group", "default"}},
-															Key:        &types.LiteralValue{Value: 0, ValueType: "number"},
+														Source: &types.ReferenceExpr{Parts: []string{"aws_security_group", "default"}},
+														Traversal: []types.TraversalElem{
+															{Type: "index", Index: &types.LiteralValue{Value: int64(0), ValueType: "number"}},
+															{Type: "attr", Name: "id"},
 														},
-														Traversal: []types.TraversalElem{{Type: "attr", Name: "id"}},
 													},
 													FalseExpr: &types.LiteralValue{Value: "", ValueType: "string"},
 												},
 												&types.ConditionalExpr{
 													Condition: &types.ReferenceExpr{Parts: []string{"var", "create_bastion_security_group"}},
 													TrueExpr: &types.RelativeTraversalExpr{
-														Source: &types.IndexExpr{
-															Collection: &types.ReferenceExpr{Parts: []string{"aws_security_group", "bastion"}},
-															Key:        &types.LiteralValue{Value: 0, ValueType: "number"},
+														Source: &types.ReferenceExpr{Parts: []string{"aws_security_group", "bastion"}},
+														Traversal: []types.TraversalElem{
+															{Type: "index", Index: &types.LiteralValue{Value: int64(0), ValueType: "number"}},
+															{Type: "attr", Name: "id"},
 														},
-														Traversal: []types.TraversalElem{{Type: "attr", Name: "id"}},
 													},
 													FalseExpr: &types.LiteralValue{Value: "", ValueType: "string"},
 												},
@@ -502,7 +563,7 @@ func createComplexModuleExpected() types.Body {
 										{
 											Key: &types.ReferenceExpr{Parts: []string{"subnets"}},
 											Value: &types.ForArrayExpr{
-												KeyVar:     "subnet",
+												ValueVar:   "subnet",
 												Collection: &types.ReferenceExpr{Parts: []string{"aws_subnet", "main"}},
 												ThenValueExpr: &types.ObjectExpr{
 													Items: []types.ObjectItem{
@@ -621,7 +682,7 @@ func createComplexModuleExpected() types.Body {
 											},
 											TrueExpr: &types.ReferenceExpr{Parts: []string{"rule", "value", "cidr_blocks"}},
 											FalseExpr: &types.ForArrayExpr{
-												KeyVar:     "cidr",
+												ValueVar:   "cidr",
 												Collection: &types.ReferenceExpr{Parts: []string{"var", "default_cidrs"}},
 												ThenValueExpr: &types.ReferenceExpr{
 													Parts: []string{"cidr"},
@@ -711,7 +772,7 @@ func createComplexResourceExpected() types.Body {
 					&types.Attribute{
 						Name: "for_each",
 						Value: &types.ForMapExpr{
-							KeyVar:        "sg",
+							ValueVar:      "sg",
 							Collection:    &types.ReferenceExpr{Parts: []string{"var", "security_groups"}},
 							ThenKeyExpr:   &types.ReferenceExpr{Parts: []string{"sg", "name"}},
 							ThenValueExpr: &types.ReferenceExpr{Parts: []string{"sg"}},
@@ -1015,7 +1076,7 @@ func createComplexLocalsExpected() types.Body {
 					&types.Attribute{
 						Name: "subnet_map",
 						Value: &types.ForMapExpr{
-							KeyVar:      "subnet",
+							ValueVar:    "subnet",
 							Collection:  &types.ReferenceExpr{Parts: []string{"var", "subnets"}},
 							ThenKeyExpr: &types.ReferenceExpr{Parts: []string{"subnet", "name"}},
 							ThenValueExpr: &types.ObjectExpr{
@@ -1026,7 +1087,7 @@ func createComplexLocalsExpected() types.Body {
 									},
 									{
 										Key:   &types.ReferenceExpr{Parts: []string{"cidr"}},
-										Value: &types.ReferenceExpr{Parts: []string{"subnet", "cidr_block"}},
+										Value: &types.ReferenceExpr{Parts: []string{"subnet", "cidr"}},
 									},
 									{
 										Key:   &types.ReferenceExpr{Parts: []string{"az"}},
@@ -1065,7 +1126,7 @@ func createComplexLocalsExpected() types.Body {
 					&types.Attribute{
 						Name: "filtered_instances",
 						Value: &types.ForArrayExpr{
-							KeyVar:     "server",
+							ValueVar:   "server",
 							Collection: &types.ReferenceExpr{Parts: []string{"var", "servers"}},
 							ThenValueExpr: &types.ObjectExpr{
 								Items: []types.ObjectItem{
@@ -1103,30 +1164,31 @@ func createComplexLocalsExpected() types.Body {
 									},
 								},
 							},
+							// && is left-associative: (env == env && contains(...)) && !contains(...)
 							Condition: &types.BinaryExpr{
 								Left: &types.BinaryExpr{
-									Left:     &types.ReferenceExpr{Parts: []string{"server", "environment"}},
-									Operator: "==",
-									Right:    &types.ReferenceExpr{Parts: []string{"var", "environment"}},
-								},
-								Operator: "&&",
-								Right: &types.BinaryExpr{
-									Left: &types.FunctionCallExpr{
+									Left: &types.BinaryExpr{
+										Left:     &types.ReferenceExpr{Parts: []string{"server", "environment"}},
+										Operator: "==",
+										Right:    &types.ReferenceExpr{Parts: []string{"var", "environment"}},
+									},
+									Operator: "&&",
+									Right: &types.FunctionCallExpr{
 										Name: "contains",
 										Args: []types.Expression{
 											&types.ReferenceExpr{Parts: []string{"var", "allowed_types"}},
 											&types.ReferenceExpr{Parts: []string{"server", "type"}},
 										},
 									},
-									Operator: "&&",
-									Right: &types.UnaryExpr{
-										Operator: "!",
-										Expr: &types.FunctionCallExpr{
-											Name: "contains",
-											Args: []types.Expression{
-												&types.ReferenceExpr{Parts: []string{"var", "excluded_ids"}},
-												&types.ReferenceExpr{Parts: []string{"server", "id"}},
-											},
+								},
+								Operator: "&&",
+								Right: &types.UnaryExpr{
+									Operator: "!",
+									Expr: &types.FunctionCallExpr{
+										Name: "contains",
+										Args: []types.Expression{
+											&types.ReferenceExpr{Parts: []string{"var", "excluded_ids"}},
+											&types.ReferenceExpr{Parts: []string{"server", "id"}},
 										},
 									},
 								},
@@ -1161,15 +1223,15 @@ func createComplexLocalsExpected() types.Body {
 													Operator: "==",
 													Right:    &types.LiteralValue{Value: "prod", ValueType: "string"},
 												},
-												TrueExpr: &types.LiteralValue{Value: 30, ValueType: "number"},
+												TrueExpr: &types.LiteralValue{Value: int64(30), ValueType: "number"},
 												FalseExpr: &types.ConditionalExpr{
 													Condition: &types.BinaryExpr{
 														Left:     &types.ReferenceExpr{Parts: []string{"var", "environment"}},
 														Operator: "==",
 														Right:    &types.LiteralValue{Value: "staging", ValueType: "string"},
 													},
-													TrueExpr:  &types.LiteralValue{Value: 14, ValueType: "number"},
-													FalseExpr: &types.LiteralValue{Value: 7, ValueType: "number"},
+													TrueExpr:  &types.LiteralValue{Value: int64(14), ValueType: "number"},
+													FalseExpr: &types.LiteralValue{Value: int64(7), ValueType: "number"},
 												},
 											},
 										},
@@ -1177,7 +1239,7 @@ func createComplexLocalsExpected() types.Body {
 									{
 										Key: &types.ReferenceExpr{Parts: []string{"targets"}},
 										Value: &types.ForArrayExpr{
-											KeyVar:     "target",
+											ValueVar:   "target",
 											Collection: &types.ReferenceExpr{Parts: []string{"var", "backup_targets"}},
 											ThenValueExpr: &types.ObjectExpr{
 												Items: []types.ObjectItem{
@@ -1319,8 +1381,8 @@ func createComplexLocalsExpected() types.Body {
 									TrueExpr: &types.ParenExpr{
 										Expression: &types.ConditionalExpr{
 											Condition: &types.ReferenceExpr{Parts: []string{"var", "high_availability"}},
-											TrueExpr:  &types.LiteralValue{Value: 300, ValueType: "number"},
-											FalseExpr: &types.LiteralValue{Value: 180, ValueType: "number"},
+											TrueExpr:  &types.LiteralValue{Value: int64(300), ValueType: "number"},
+											FalseExpr: &types.LiteralValue{Value: int64(180), ValueType: "number"},
 										},
 									},
 									FalseExpr: &types.ParenExpr{
@@ -1330,8 +1392,8 @@ func createComplexLocalsExpected() types.Body {
 												Operator: "==",
 												Right:    &types.LiteralValue{Value: "staging", ValueType: "string"},
 											},
-											TrueExpr:  &types.LiteralValue{Value: 120, ValueType: "number"},
-											FalseExpr: &types.LiteralValue{Value: 60, ValueType: "number"},
+											TrueExpr:  &types.LiteralValue{Value: int64(120), ValueType: "number"},
+											FalseExpr: &types.LiteralValue{Value: int64(60), ValueType: "number"},
 										},
 									},
 								},
@@ -2059,7 +2121,7 @@ func createComplexVariableExpected() types.Body {
 																		Value: &types.ReferenceExpr{Parts: []string{"number"}},
 																	},
 																	{
-																		Key: &types.ReferenceExpr{Parts: []string{"Args"}},
+																		Key: &types.ReferenceExpr{Parts: []string{"parameters"}},
 																		Value: &types.FunctionCallExpr{
 																			Name: "map",
 																			Args: []types.Expression{
@@ -2177,13 +2239,13 @@ func createComplexVariableExpected() types.Body {
 									Left: &types.BinaryExpr{
 										Left:     &types.ReferenceExpr{Parts: []string{"var", "complex_var", "count"}},
 										Operator: ">",
-										Right:    &types.LiteralValue{Value: 0, ValueType: "number"},
+										Right:    &types.LiteralValue{Value: int64(0), ValueType: "number"},
 									},
 									Operator: "&&",
 									Right: &types.BinaryExpr{
 										Left:     &types.ReferenceExpr{Parts: []string{"var", "complex_var", "count"}},
 										Operator: "<=",
-										Right:    &types.LiteralValue{Value: 10, ValueType: "number"},
+										Right:    &types.LiteralValue{Value: int64(10), ValueType: "number"},
 									},
 								},
 							},
@@ -2230,7 +2292,7 @@ func createComplexVariableExpected() types.Body {
 										},
 									},
 									Operator: ">",
-									Right:    &types.LiteralValue{Value: 0, ValueType: "number"},
+									Right:    &types.LiteralValue{Value: int64(0), ValueType: "number"},
 								},
 							},
 							&types.Attribute{
@@ -2248,13 +2310,13 @@ func createComplexVariableExpected() types.Body {
 									Name: "alltrue",
 									Args: []types.Expression{
 										&types.ForArrayExpr{
-											KeyVar:     "instance",
+											ValueVar:   "instance",
 											Collection: &types.ReferenceExpr{Parts: []string{"var", "complex_var", "instances"}},
 											ThenValueExpr: &types.BinaryExpr{
 												Left: &types.BinaryExpr{
 													Left:     &types.ReferenceExpr{Parts: []string{"instance", "root_volume", "size"}},
 													Operator: ">=",
-													Right:    &types.LiteralValue{Value: 20, ValueType: "number"},
+													Right:    &types.LiteralValue{Value: int64(20), ValueType: "number"},
 												},
 												Operator: "&&",
 												Right: &types.BinaryExpr{
@@ -2316,7 +2378,7 @@ func createComplexOutputExpected() types.Body {
 								{
 									Key: &types.ReferenceExpr{Parts: []string{"instance_details"}},
 									Value: &types.ForMapExpr{
-										KeyVar:      "instance",
+										ValueVar:    "instance",
 										Collection:  &types.ReferenceExpr{Parts: []string{"local", "filtered_instances"}},
 										ThenKeyExpr: &types.ReferenceExpr{Parts: []string{"instance", "id"}},
 										ThenValueExpr: &types.ObjectExpr{
@@ -2451,7 +2513,7 @@ func createComplexProviderExpected() types.Body {
 										&types.LiteralValue{Value: "-", ValueType: "string"},
 										&types.FunctionCallExpr{
 											Name: "formatdate",
-											Args: []types.Expression{&types.LiteralValue{Value: "YYYYMMDDhhmmss", ValueType: "string"}, &types.FunctionCallExpr{Name: "timestamp"}},
+											Args: []types.Expression{&types.LiteralValue{Value: "YYYY-MM-DD-hh-mm-ss", ValueType: "string"}, &types.FunctionCallExpr{Name: "timestamp"}},
 										},
 									},
 								},

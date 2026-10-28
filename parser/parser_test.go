@@ -1,12 +1,14 @@
 package parser
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
 
 	"github.com/gerdou/terralint/parser/types"
+	"github.com/hashicorp/hcl/v2"
 )
 
 // TestCase represents a test case for the parser
@@ -249,149 +251,58 @@ func compareAttributes(t *testing.T, expected, actual *types.Attribute) {
 	}
 
 	// Compare the attribute values
-	compareExpressions(t, expected.Value, actual.Value)
+	compareExpressions(t, expected.Name, expected.Value, actual.Value)
 }
 
-// compareExpressions compares two Expression structures
-func compareExpressions(t *testing.T, expected, actual types.Expression) {
-	// Check if both are nil
-	if expected == nil && actual == nil {
-		return
+// compareExpressions compares two expression trees field by field, all the
+// way down, Go types included. Source ranges are left out: the expected trees
+// do not carry them, and TestFidelity checks them.
+func compareExpressions(t *testing.T, name string, expected, actual types.Expression) {
+	t.Helper()
+	for _, d := range diffValues(name, reflect.ValueOf(&expected).Elem(), reflect.ValueOf(&actual).Elem()) {
+		t.Error(d)
 	}
+}
 
-	// Check if one is nil but the other isn't
-	if (expected == nil && actual != nil) || (expected != nil && actual == nil) {
-		t.Errorf("Expression nil mismatch: expected %v, got %v", expected, actual)
-		return
+// diffValues returns one line for each place where exp and act differ, named
+// by its path from the compared value.
+func diffValues(path string, exp, act reflect.Value) []string {
+	if exp.Type() == reflect.TypeOf(hcl.Range{}) {
+		return nil
 	}
-
-	// Check if the expression types match
-	if expected.ExpressionType() != actual.ExpressionType() {
-		// Print more details about the expressions
-		t.Errorf("Expression type mismatch: expected %s, got %s. Expected: %T, Actual: %T",
-			expected.ExpressionType(), actual.ExpressionType(), expected, actual)
-
-		// Print more details for reference expressions
-		if ref, ok := expected.(*types.ReferenceExpr); ok {
-			t.Logf("Expected reference parts: %v", ref.Parts)
+	switch exp.Kind() {
+	case reflect.Interface, reflect.Pointer:
+		if exp.IsNil() || act.IsNil() {
+			if exp.IsNil() != act.IsNil() {
+				return []string{fmt.Sprintf("%s: expected %T, got %T", path, exp.Interface(), act.Interface())}
+			}
+			return nil
 		}
-		if ref, ok := actual.(*types.ReferenceExpr); ok {
-			t.Logf("Actual reference parts: %v", ref.Parts)
+		if exp.Elem().Type() != act.Elem().Type() {
+			return []string{fmt.Sprintf("%s: expected %T, got %T", path, exp.Elem().Interface(), act.Elem().Interface())}
 		}
-
-		// Print more details for array expressions
-		if arr, ok := expected.(*types.ArrayExpr); ok {
-			t.Logf("Expected array items count: %d", len(arr.Items))
+		return diffValues(path, exp.Elem(), act.Elem())
+	case reflect.Struct:
+		var diffs []string
+		for i := 0; i < exp.NumField(); i++ {
+			diffs = append(diffs, diffValues(path+"."+exp.Type().Field(i).Name, exp.Field(i), act.Field(i))...)
 		}
-		if arr, ok := actual.(*types.ArrayExpr); ok {
-			t.Logf("Actual array items count: %d", len(arr.Items))
+		return diffs
+	case reflect.Slice:
+		if exp.Len() != act.Len() {
+			return []string{fmt.Sprintf("%s: expected %d items, got %d", path, exp.Len(), act.Len())}
 		}
-
-		return
+		var diffs []string
+		for i := 0; i < exp.Len(); i++ {
+			diffs = append(diffs, diffValues(fmt.Sprintf("%s[%d]", path, i), exp.Index(i), act.Index(i))...)
+		}
+		return diffs
+	default:
+		if !reflect.DeepEqual(exp.Interface(), act.Interface()) {
+			return []string{fmt.Sprintf("%s: expected %#v, got %#v", path, exp.Interface(), act.Interface())}
+		}
+		return nil
 	}
-
-	// Compare based on expression type
-	switch exp := expected.(type) {
-	case *types.LiteralValue:
-		act, ok := actual.(*types.LiteralValue)
-		if !ok {
-			t.Errorf("Type assertion failed: expected *types.LiteralValue, got %T", actual)
-			return
-		}
-		// Compare value type
-		if exp.ValueType != act.ValueType {
-			t.Errorf("Literal value type mismatch: expected %s, got %s", exp.ValueType, act.ValueType)
-		}
-		// For string literals, compare the string value
-		if exp.ValueType == "string" {
-			expStr, expOk := exp.Value.(string)
-			actStr, actOk := act.Value.(string)
-			if expOk && actOk && expStr != actStr {
-				t.Errorf("String literal value mismatch: expected %s, got %s", expStr, actStr)
-			}
-		}
-	case *types.ObjectExpr:
-		act, ok := actual.(*types.ObjectExpr)
-		if !ok {
-			t.Errorf("Type assertion failed: expected *types.ObjectExpr, got %T", actual)
-			return
-		}
-		// Check if the number of items matches
-		if len(exp.Items) != len(act.Items) {
-			t.Errorf("Object items count mismatch: expected %d, got %d", len(exp.Items), len(act.Items))
-			return
-		}
-		// Compare each item
-		for i, expItem := range exp.Items {
-			if i >= len(act.Items) {
-				t.Errorf("Missing object item at index %d in actual", i)
-				continue
-			}
-			// Compare comments for object items
-			if expItem.BlockComment != act.Items[i].BlockComment {
-				t.Errorf("Object item block comment mismatch at index %d: expected %q, got %q",
-					i, expItem.BlockComment, act.Items[i].BlockComment)
-			}
-			if expItem.InlineComment != act.Items[i].InlineComment {
-				t.Errorf("Object item inline comment mismatch at index %d: expected %q, got %q",
-					i, expItem.InlineComment, act.Items[i].InlineComment)
-			}
-			compareExpressions(t, expItem.Key, act.Items[i].Key)
-			compareExpressions(t, expItem.Value, act.Items[i].Value)
-		}
-	case *types.ArrayExpr:
-		act, ok := actual.(*types.ArrayExpr)
-		if !ok {
-			t.Errorf("Type assertion failed: expected *types.ArrayExpr, got %T", actual)
-			return
-		}
-		// Check if the number of items matches
-		if len(exp.Items) != len(act.Items) {
-			t.Errorf("Array items count mismatch: expected %d, got %d", len(exp.Items), len(act.Items))
-
-			// Print the array items for debugging
-			t.Logf("Expected array items:")
-			for i, item := range exp.Items {
-				switch v := item.(type) {
-				case *types.LiteralValue:
-					t.Logf("  %d: %v (%s)", i, v.Value, v.ValueType)
-				default:
-					t.Logf("  %d: %T", i, item)
-				}
-			}
-
-			t.Logf("Actual array items:")
-			for i, item := range act.Items {
-				switch v := item.(type) {
-				case *types.LiteralValue:
-					t.Logf("  %d: %v (%s)", i, v.Value, v.ValueType)
-				default:
-					t.Logf("  %d: %T", i, item)
-				}
-			}
-
-			return
-		}
-		// Compare each item
-		for i, expItem := range exp.Items {
-			if i >= len(act.Items) {
-				t.Errorf("Missing array item at index %d in actual", i)
-				continue
-			}
-			compareExpressions(t, expItem, act.Items[i])
-		}
-	case *types.ReferenceExpr:
-		act, ok := actual.(*types.ReferenceExpr)
-		if !ok {
-			t.Errorf("Type assertion failed: expected *types.ReferenceExpr, got %T", actual)
-			return
-		}
-		// Check if the parts match
-		if !reflect.DeepEqual(exp.Parts, act.Parts) {
-			t.Errorf("Reference parts mismatch: expected %v, got %v", exp.Parts, act.Parts)
-		}
-	}
-	// Add more expression type comparisons as needed
 }
 
 // Helper function to compare string slices

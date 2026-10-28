@@ -25,8 +25,8 @@ func isTerraformFile(path string) bool {
 }
 
 // forEachFile runs fn on path, or, when path is a directory, once on every
-// regular .tf and .tfvars file under it. Symbolic links are not followed. It
-// goes on past failures and returns all of them.
+// regular .tf and .tfvars file under it. Symbolic links under it are not
+// followed. It goes on past failures and returns all of them.
 func forEachFile(path string, fn func(string) error) error {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -39,7 +39,9 @@ func forEachFile(path string, fn func(string) error) error {
 		return fn(path)
 	}
 	var errs []error
-	err = filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+	// The trailing separator makes WalkDir follow path itself when it is a
+	// link to a directory; links inside it are still skipped.
+	err = filepath.WalkDir(path+string(filepath.Separator), func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			errs = append(errs, err)
 		} else if d.Type().IsRegular() && isTerraformFile(p) {

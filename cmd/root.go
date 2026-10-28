@@ -40,11 +40,28 @@ func Execute() {
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVarP(&terraformFilePath, "file", "f", "", "The path to a terraform file.")
-	rootCmd.PersistentFlags().StringVarP(&terraformDirectoryPath, "directory", "d", "", "The path to the root of a terraform repository.")
+	rootCmd.PersistentFlags().VarP(&onceString{p: &terraformFilePath}, "file", "f", "The path to a terraform file.")
+	rootCmd.PersistentFlags().VarP(&onceString{p: &terraformDirectoryPath}, "directory", "d", "The path to the root of a terraform repository.")
 	rootCmd.MarkFlagsMutuallyExclusive("file", "directory")
 
 	rootCmd.Flags().BoolVarP(&versionFlag, "version", "v", false, "Print the version number of terralint.")
+}
+
+// onceString is a string flag that rejects a second value; a plain string flag
+// would keep only the last one and silently skip the inputs given before it.
+type onceString struct {
+	p   *string
+	set bool
+}
+
+func (s *onceString) String() string { return *s.p }
+func (s *onceString) Type() string   { return "string" }
+func (s *onceString) Set(v string) error {
+	if s.set {
+		return errors.New("given more than once: name one file with -f or one directory with -d")
+	}
+	*s.p, s.set = v, true
+	return nil
 }
 
 func validateArgs(cmd *cobra.Command, args []string) error {
