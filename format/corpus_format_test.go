@@ -352,9 +352,10 @@ func checkOutput(path string, src, out []byte) []string {
 		}
 	}
 
-	// Naming: no unquoted identifier keeps a '-'.
-	for _, tok := range outToks {
-		if tok.Type == hclsyntax.TokenIdent && bytes.ContainsRune(tok.Bytes, '-') {
+	// Naming: no unquoted identifier keeps a '-', except provider local names (D12).
+	keep := providerRanges(outFile.Body.(*hclsyntax.Body))
+	for i, tok := range outToks {
+		if tok.Type == hclsyntax.TokenIdent && bytes.ContainsRune(tok.Bytes, '-') && !keep(tok, outToks, i) {
 			fail("line %d: identifier %q still has a '-'", tok.Range.Start.Line, tok.Bytes)
 		}
 	}
@@ -394,12 +395,47 @@ func doubleBlank(toks hclsyntax.Tokens) (int, bool) {
 	return 0, false
 }
 
+// providerRanges reports whether a token names a provider local name, which
+// keeps its '-' (D12): inside a required_providers block, in the value of a
+// provider or providers attribute, or a provider-function namespace (next to ::).
+func providerRanges(b *hclsyntax.Body) func(tok hclsyntax.Token, toks hclsyntax.Tokens, i int) bool {
+	var ranges []hcl.Range
+	var walk func(b *hclsyntax.Body)
+	walk = func(b *hclsyntax.Body) {
+		for name, a := range b.Attributes {
+			if name == "provider" || name == "providers" {
+				ranges = append(ranges, a.SrcRange)
+			}
+		}
+		for _, blk := range b.Blocks {
+			if blk.Type == "required_providers" {
+				ranges = append(ranges, blk.Range())
+			}
+			walk(blk.Body)
+		}
+	}
+	walk(b)
+	return func(tok hclsyntax.Token, toks hclsyntax.Tokens, i int) bool {
+		if (i > 0 && toks[i-1].Type == hclsyntax.TokenDoubleColon) || (i+1 < len(toks) && toks[i+1].Type == hclsyntax.TokenDoubleColon) {
+			return true
+		}
+		for _, r := range ranges {
+			if tok.Range.Start.Byte >= r.Start.Byte && tok.Range.End.Byte <= r.End.Byte {
+				return true
+			}
+		}
+		return false
+	}
+}
+
 // ---- Meaning: a canonical dump with the intended changes applied. ----
 
 func ren(s string) string { return strings.ReplaceAll(s, "-", "_") }
 
 // Labels that name things, by block type: the label index that is renamed.
-var namedLabel = map[string]int{"variable": 0, "output": 0, "module": 0, "provider": 0, "dynamic": 0, "resource": 1, "data": 1}
+// Provider block labels are not here: provider local names are never renamed
+// (D12), because Terraform rejects "_" in them.
+var namedLabel = map[string]int{"variable": 0, "output": 0, "module": 0, "dynamic": 0, "resource": 1, "data": 1, "ephemeral": 1}
 
 func blockLabels(b *hclsyntax.Block) []string {
 	labels := append([]string{}, b.Labels...)
