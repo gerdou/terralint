@@ -30,9 +30,11 @@ type Config struct {
 
 	// BlankLinesAroundMultiLine separates an item that spans lines from its
 	// neighbours; BlankLinesBetweenTopLevelBlocks separates the blocks of a
-	// file.
+	// file; BlankLinesBeforeFileEndComments separates the comments at the
+	// end of a file from the last item.
 	BlankLinesAroundMultiLine       int `yaml:"blank_lines_around_multi_line"`
 	BlankLinesBetweenTopLevelBlocks int `yaml:"blank_lines_between_top_level_blocks"`
+	BlankLinesBeforeFileEndComments int `yaml:"blank_lines_before_file_end_comments"`
 
 	Naming Naming `yaml:"naming"`
 
@@ -106,10 +108,11 @@ func Default() *Config {
 		ListWidth:                       80,
 		BlankLinesAroundMultiLine:       1,
 		BlankLinesBetweenTopLevelBlocks: 1,
+		BlankLinesBeforeFileEndComments: 1,
 		Naming: Naming{
 			Replace: "-",
 			With:    "_",
-			Labels:  map[string]int{"variable": 0, "output": 0, "module": 0, "provider": 0, "dynamic": 0, "resource": 1, "data": 1},
+			Labels:  map[string]int{"variable": 0, "output": 0, "module": 0, "provider": 0, "dynamic": 0, "resource": 1, "data": 1, "ephemeral": 1},
 		},
 		TopLevel: topLevel,
 		Priorities: map[string]Priority{

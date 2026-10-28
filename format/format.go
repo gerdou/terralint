@@ -26,7 +26,7 @@ func File(path string, cfg *config.Config) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	f := &formatter{cfg: cfg, root: root}
+	f := &formatter{cfg: cfg, root: root, tfvars: filepath.Ext(path) == ".tfvars"}
 	f.exempt = f.exemptions(path)
 
 	top := f.planFile()
@@ -45,6 +45,8 @@ type formatter struct {
 	cfg    *config.Config
 	root   *types.Root
 	exempt *exemptions
+	tfvars bool     // the file sets variables: its attributes are named after them
+	header []string // the file header the printer puts first, as planFile found it
 }
 
 // on reports whether rule applies under the rules turned off in off.
@@ -131,8 +133,8 @@ func (ex *exemptions) add(n types.Body) {
 		ex.prefixes = append(ex.prefixes, []string{"module", label(0)})
 	case "resource":
 		ex.prefixes = append(ex.prefixes, []string{label(0), label(1)})
-	case "data":
-		ex.prefixes = append(ex.prefixes, []string{"data", label(0), label(1)})
+	case "data", "ephemeral":
+		ex.prefixes = append(ex.prefixes, []string{b.Type, label(0), label(1)})
 	case "provider":
 		ex.prefixes = append(ex.prefixes, []string{label(0)})
 		ex.names[label(0)] = true

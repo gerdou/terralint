@@ -7,7 +7,16 @@ type Body interface {
 	BodyType() string
 }
 
-// Root represents the top-level HCL document
+// Root represents the top-level HCL document.
+//
+// Every comment field (the fields whose names end in Comment) holds its
+// comments one per line. A /* */ comment is held whole, over as many lines
+// as it spans; it is the only comment held starting with /*. A # or //
+// comment is held without its marker and the one space after it ("# note"
+// is "note"), unless no space follows the marker or the text after it
+// starts with #, // or /*: then it is held whole, as written ("#####",
+// "#x", "# /* x */"). So, outside the lines of a /* */ comment, a line that
+// starts with # or // is a comment held whole.
 type Root struct {
 	Children []Body
 
@@ -15,13 +24,19 @@ type Root struct {
 	// blank line separates from the rest, one per line. They also start that
 	// item's BlockComment, which holds every comment above the item.
 	Header string
+	// HeaderGroups is the header in the groups that blank lines separate;
+	// Header joins them.
+	HeaderGroups []string
 	// EndComment holds the comments after the last item, one per line.
 	EndComment string
-	// Text holds how every number, quoted string, template and heredoc in
-	// the file was written, which HCL's parse discards: escapes, strip
-	// markers, directives, heredoc lines and number spellings. It is keyed by
-	// node and kept beside the tree, so that the expression types keep their
-	// fields.
+	// Text holds how the numbers, templates and heredocs of the file's
+	// expressions, quoted strings included, were written, which HCL's parse
+	// discards: escapes, strip markers, directives, heredoc lines and number
+	// spellings. The literal keys of traversal steps (x["k"], x[0]) are not
+	// in it: they keep only their value. It may also hold entries for the
+	// branches of directives, which are laid out with the template holding
+	// them. It is keyed by node and kept beside the tree, so that the
+	// expression types keep their fields.
 	Text map[Expression][]TextPiece
 }
 
@@ -35,6 +50,7 @@ type Block struct {
 	Labels        []string  // Labels/identifiers for the block (e.g., "aws_instance" "example")
 	Range         hcl.Range // Source code position information
 	InlineComment string    // The first comment on the block's first line, after its start and before the next sibling or the container's end
+	InlineInside  bool      // InlineComment is also the InlineComment of an item inside the block that starts on the same line; it follows that item
 	BlockComment  string    // The comments on the lines between the previous sibling (or the container's start) and the block, one per line
 	Children      []Body    // Nested blocks and attributes
 	EndComment    string    // The comments inside the block after its last child (or its opening line, when it has none), one per line
@@ -51,6 +67,7 @@ type Attribute struct {
 	Value         Expression // The value of the attribute
 	Range         hcl.Range
 	InlineComment string // The first comment on the attribute's first line, after its start and before the next sibling or the container's end
+	InlineInside  bool   // InlineComment is also the InlineComment of an object item inside the value that starts on the same line; it follows that item
 	BlockComment  string // The comments on the lines between the previous sibling (or the container's start) and the attribute, one per line
 	TrailComment  string // The comments after the attribute on its last line, besides InlineComment
 }

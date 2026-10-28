@@ -381,8 +381,8 @@ resource "a" "b" { # inline
 
 resource "a" "b" { # inline
   bin = (
-    # after a
-    var.a + var.b
+    var.a # after a
+    + var.b
   )
 
   call = f(
@@ -392,13 +392,12 @@ resource "a" "b" { # inline
   )
 
   cond = (
-    # after the condition
-    var.a ? 1 : 2
+    var.a # after the condition
+    ? 1 : 2
   )
 
-  for = [for x in var.y :
-    # after x
-    x
+  for = [
+    for x in var.y : x # after x
   ]
 
   list = [
@@ -599,5 +598,348 @@ locals {
   y = 1
   # }
 }
+`)
+}
+
+// Fixes from review round 1, each checked for stability by check.
+func TestRound1Comments(t *testing.T) {
+	// A comment on a line that opens an item and starts one inside it is
+	// printed once, with the inner item (R1a-001, R1c-003).
+	check(t, nil, `locals {
+  tags = { Name = "x" # name tag
+    Env = "y"
+  }
+  o = { source = "x", /* pin */ version = "2.1.0" }
+}
+
+resource "a" "b" {
+  allow { protocol = "icmp" /* ping */ }
+}
+`, `locals {
+  o = {
+    source  = "x" # pin
+    version = "2.1.0"
+  }
+
+  tags = {
+    Env  = "y"
+    Name = "x" # name tag
+  }
+}
+
+resource "a" "b" {
+  allow {
+    protocol = "icmp" # ping
+  }
+}
+`)
+
+	// # comments are kept as written; // and /* */ become # (R1a-004, R1c-004).
+	check(t, nil, `###############
+### Network ###
+#no space
+# /*.json files
+#   * bullet
+#  */
+locals {
+  // slash
+  /* block
+     * star */
+  a = 1 #tight
+}
+`, `###############
+### Network ###
+#no space
+# /*.json files
+#   * bullet
+#  */
+locals {
+  # slash
+  # block
+  # star
+  a = 1 #tight
+}
+`)
+
+	// Comments on the operands of a chain or conditional stay with them, in
+	// order (R1c-001); a comment inside an argument or element makes the
+	// call or list one per line (R1c-002).
+	check(t, nil, `locals {
+  all = (
+    var.a || # first
+    var.b || # second
+    var.c    # third
+  )
+  x = (
+    var.a != null # set explicitly
+    ? var.a       # use it
+    : "default"   # fallback
+  )
+  name = format("%s-%s", var.prefix,
+    var.suffix != null # suffix set by caller
+    ? var.suffix : "default")
+  y = [
+    var.a,
+    var.enabled # only when enabled
+    ? var.b : null,
+  ]
+}
+`, `locals {
+  all = (
+    var.a    # first
+    || var.b # second
+    || var.c # third
+  )
+
+  name = format(
+    "%s-%s",
+    var.prefix,
+    var.suffix != null # suffix set by caller
+    ? var.suffix : "default",
+  )
+
+  x = (
+    var.a != null # set explicitly
+    ? var.a       # use it
+    : "default"   # fallback
+  )
+
+  y = [
+    var.a,
+    var.enabled # only when enabled
+    ? var.b : null,
+  ]
+}
+`)
+}
+
+func TestRound1ElementEnd(t *testing.T) {
+	// A comment held inside the last part of an element ends up after its
+	// comma, where the next run reads it as the element's own (R1c-002).
+	check(t, nil, `locals {
+  a = [
+    var.a ? local.p : local /* first */ .x,
+    var.b ? local.q : local /* second */ .y,
+    3,
+  ]
+}
+`, `locals {
+  a = [
+    var.a ? local.p : local.x, # first
+    var.b ? local.q : local.y, # second
+    3,
+  ]
+}
+`)
+}
+
+func TestRound1Templates(t *testing.T) {
+	// An indented heredoc may start with a directive (R1a-002).
+	check(t, nil, `locals {
+  c = <<-EOT
+    %{ for ip in var.ips ~}
+    server ${ip}
+    %{ endfor ~}
+  EOT
+}
+`, `locals {
+  c = <<-EOT
+    %{for ip in var.ips~}
+    server ${ip}
+    %{endfor~}
+  EOT
+}
+`)
+}
+
+func TestRound1Naming(t *testing.T) {
+	// In an exempt item, references to names declared elsewhere are renamed;
+	// its own names, for-expression variables and kept dynamic iterators are
+	// not (R1b-001).
+	check(t, nil, `variable "bucket-name" {}
+
+locals {
+  common-tags = { team = "x" }
+}
+
+# terralint ignore_naming
+resource "aws_s3_bucket" "my-bucket" {
+  bucket = var.bucket-name
+  tags   = { my-key = local.common-tags }
+  names  = [for my-x in var.bucket-name : my-x]
+  dynamic "my-rule" {
+    for_each = var.bucket-name
+    iterator = my-it
+    content {
+      id = my-it.value
+    }
+  }
+}
+`, `locals {
+  common_tags = {
+    team = "x"
+  }
+}
+
+# terralint ignore_naming
+resource "aws_s3_bucket" "my-bucket" {
+  bucket = var.bucket_name
+  names  = [for my-x in var.bucket_name : my-x]
+
+  dynamic "my-rule" {
+    for_each = var.bucket_name
+    iterator = my-it
+
+    content {
+      id = my-it.value
+    }
+  }
+
+  tags = {
+    my-key = local.common_tags
+  }
+}
+
+variable "bucket_name" {}
+`)
+
+	// ephemeral labels are names, like data's (R1b-008).
+	check(t, nil, `ephemeral "random_password" "db-pass" {}
+
+output "o" {
+  value = ephemeral.random_password.db-pass.result
+}
+`, `ephemeral "random_password" "db_pass" {}
+
+output "o" {
+  value = ephemeral.random_password.db_pass.result
+}
+`)
+
+	// Exemptions reach references through dynamic indexes (R1b-005) and
+	// variable assignments in .tfvars files (R1b-004).
+	files := map[string]string{
+		"vars.tf": `# terralint ignore_naming
+variable "instance-type" {}
+
+# terralint ignore_naming
+locals {
+  my-map = {
+    a = {
+      sub-key = "x"
+    }
+  }
+}
+`,
+		"main.tf": `output "o" {
+  value = [local.my-map[var.k].sub-key, local.my-map[*].sub-key]
+}
+`,
+		"terraform.tfvars": `instance-type = "t3.micro"
+other-type    = "t3.small"
+`,
+	}
+	if got, want := formatSource(t, config.Default(), "main.tf", files), `output "o" {
+  value = [local.my-map[var.k].sub-key, local.my-map[*].sub-key]
+}
+`; got != want {
+		t.Errorf("main.tf:\n%s\nwant:\n%s", got, want)
+	}
+	if got, want := formatSource(t, config.Default(), "terraform.tfvars", files), `instance-type = "t3.micro"
+other_type    = "t3.small"
+`; got != want {
+		t.Errorf("terraform.tfvars:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestRound1Order(t *testing.T) {
+	// Top-level blocks in a priority group sort by labels too (R1b-006).
+	check(t, nil, `provider "google" {}
+
+provider "aws" {}
+
+provider "azurerm" {}
+`, `provider "aws" {}
+
+provider "azurerm" {}
+
+provider "google" {}
+`)
+}
+
+func TestRound1Sections(t *testing.T) {
+	// A marker in the comments at the top of the file, with a blank line
+	// under it, is not part of the file header (R1b-002).
+	check(t, nil, `# Copyright
+
+# Keep these dashed
+# terralint ignore_naming {
+
+resource "a" "logs-bucket" {}
+# }
+
+resource "a" "new-bucket" {}
+`, `# Copyright
+
+# Keep these dashed
+# terralint ignore_naming {
+resource "a" "logs-bucket" {}
+# }
+
+resource "a" "new_bucket" {}
+`)
+
+	// Locals blocks merge only with blocks under the same section and
+	// markers, so that their items keep their rule switches (R1b-003).
+	check(t, nil, `locals {
+  a-b = 1
+}
+
+# terralint ignore_naming {
+locals {
+  c-d = 2
+}
+# }
+
+# terralint ignore_ordering
+locals {
+  y = 2
+  c = 2
+}
+
+locals {
+  e = local.c-d
+}
+`, `locals {
+  a_b = 1
+  e   = local.c-d
+}
+
+# terralint ignore_naming {
+locals {
+  c-d = 2
+}
+# }
+
+# terralint ignore_ordering
+locals {
+  y = 2
+  c = 2
+}
+`)
+}
+
+func TestRound1Config(t *testing.T) {
+	// The blank lines before a file's end comments come from config
+	// (R1b-009, R1c-007).
+	cfg := config.Default()
+	cfg.BlankLinesBetweenTopLevelBlocks, cfg.BlankLinesAroundMultiLine, cfg.BlankLinesBeforeFileEndComments = 0, 0, 0
+	check(t, cfg, `resource "a" "x" {}
+resource "a" "y" {}
+
+# end of file
+`, `resource "a" "x" {}
+resource "a" "y" {}
+# end of file
 `)
 }

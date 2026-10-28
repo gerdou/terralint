@@ -40,6 +40,7 @@ func ParseTerraformFile(filePath string) (*types.Root, error) {
 		}
 	}
 	c.claimed = make([]bool, len(c.comments))
+	c.inlines = make([]int, len(c.comments))
 
 	root := &types.Root{Children: make([]types.Body, 0), Text: c.text}
 	body := file.Body.(*hclsyntax.Body)
@@ -56,7 +57,8 @@ func ParseTerraformFile(filePath string) (*types.Root, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", filePath, err)
 	}
-	root.Header = c.header(sortedItems(body)[0].Range().Start.Line)
+	root.HeaderGroups = c.header(sortedItems(body)[0].Range().Start.Line)
+	root.Header = strings.Join(root.HeaderGroups, "\n")
 	return root, nil
 }
 
@@ -65,18 +67,26 @@ type converter struct {
 	tokens   hclsyntax.Tokens
 	comments []hclsyntax.Token       // in source order
 	claimed  []bool                  // comments already held by the AST, by index
+	inlines  []int                   // how many items hold each comment as their InlineComment
 	heredocs map[int]hclsyntax.Token // heredoc openers by start byte
 	text     map[types.Expression][]types.TextPiece
 }
 
-// stripCommentPrefix returns the text of a line comment: without its marker,
-// the one space after it and trailing space, so that indentation inside the
-// text is kept. A /* */ comment is returned whole.
+// stripCommentPrefix returns a comment as the AST holds it (see
+// types.Root), without trailing space. A # or // comment loses its marker
+// and the one space after it, so that indentation inside the text is kept.
+// It is kept whole, marker included, when no space follows the marker or the
+// text after it starts like a comment (#, //, /*): the text alone would then
+// read as another comment. A /* */ comment is kept whole.
 func stripCommentPrefix(comment string) string {
 	comment = strings.TrimRightFunc(comment, unicode.IsSpace)
 	for _, marker := range []string{"//", "#"} {
 		if strings.HasPrefix(comment, marker) {
-			return strings.TrimPrefix(comment[len(marker):], " ")
+			text, spaced := strings.CutPrefix(comment[len(marker):], " ")
+			if !spaced || strings.HasPrefix(text, "#") || strings.HasPrefix(text, "//") || strings.HasPrefix(text, "/*") {
+				return comment
+			}
+			return text
 		}
 	}
 	return strings.TrimSpace(comment)
@@ -119,18 +129,22 @@ func (c *converter) leading(afterLine, beforeLine int) string {
 }
 
 // inline returns the first comment on start's line that starts after start
-// and before the byte offset limit.
-func (c *converter) inline(start hcl.Pos, limit int) string {
+// and before the byte offset limit. An item inside this one that starts on
+// the same line can have the same comment as its InlineComment; inside,
+// called once the item's insides are converted, reports whether one does.
+func (c *converter) inline(start hcl.Pos, limit int) (text string, inside func() bool) {
 	for i := c.commentsFrom(start.Line); i < len(c.comments); i++ {
 		tok := c.comments[i]
 		if tok.Range.Start.Line > start.Line || tok.Range.Start.Byte >= limit {
 			break
 		}
 		if tok.Range.Start.Byte > start.Byte {
-			return c.join([]int{i})
+			c.inlines[i]++
+			n := c.inlines[i]
+			return c.join([]int{i}), func() bool { return c.inlines[i] > n }
 		}
 	}
-	return ""
+	return "", func() bool { return false }
 }
 
 // lastLine is the line a comment ends on; a line comment's token takes in
@@ -143,8 +157,9 @@ func lastLine(tok hclsyntax.Token) int {
 }
 
 // header returns the file header: the comments above the first item, which
-// starts on line first, up to the last blank line among them.
-func (c *converter) header(first int) string {
+// starts on line first, up to the last blank line among them, in the groups
+// that blank lines separate.
+func (c *converter) header(first int) []string {
 	var above []hclsyntax.Token
 	for _, tok := range c.comments {
 		if tok.Range.Start.Line >= first {
@@ -152,21 +167,19 @@ func (c *converter) header(first int) string {
 		}
 		above = append(above, tok)
 	}
-	cut := 0
+	var groups, texts []string
 	for i, tok := range above {
+		texts = append(texts, stripCommentPrefix(string(tok.Bytes)))
 		next := first
 		if i+1 < len(above) {
 			next = above[i+1].Range.Start.Line
 		}
 		if next-lastLine(tok) >= 2 {
-			cut = i + 1
+			groups = append(groups, strings.Join(texts, "\n"))
+			texts = nil
 		}
 	}
-	var texts []string
-	for _, tok := range above[:cut] {
-		texts = append(texts, stripCommentPrefix(string(tok.Bytes)))
-	}
-	return strings.Join(texts, "\n")
+	return groups
 }
 
 func sortedItems(body *hclsyntax.Body) []hclsyntax.Node {
@@ -205,7 +218,8 @@ func (c *converter) body(body *hclsyntax.Body, openLine, startByte, endByte int)
 			limit = items[i+1].Range().Start.Byte
 		}
 		start := item.Range().Start
-		blockComment, inlineComment := c.leading(prevEndLine, start.Line), c.inline(start, limit)
+		blockComment := c.leading(prevEndLine, start.Line)
+		inlineComment, inlineInside := c.inline(start, limit)
 
 		switch item := item.(type) {
 		case *hclsyntax.Attribute:
@@ -219,6 +233,7 @@ func (c *converter) body(body *hclsyntax.Body, openLine, startByte, endByte int)
 				Value:         value,
 				Range:         item.SrcRange,
 				InlineComment: inlineComment,
+				InlineInside:  inlineInside(),
 				BlockComment:  blockComment,
 			}
 			children = append(children, attr)
@@ -234,6 +249,7 @@ func (c *converter) body(body *hclsyntax.Body, openLine, startByte, endByte int)
 				Range:         item.Range(),
 				Children:      nested,
 				InlineComment: inlineComment,
+				InlineInside:  inlineInside(),
 				BlockComment:  blockComment,
 				EndComment:    end,
 			}
@@ -520,11 +536,14 @@ func (c *converter) sequenceEnd(i int) int {
 }
 
 // partIn returns the first of parts, from *next on, that starts at or after
-// from and ends at or before to, and moves *next past it.
+// from and ends at or before to, and moves *next past it. Parts of no width
+// are skipped: HCL leaves an empty literal where it strips the indentation
+// before a directive that starts a <<- heredoc line, and no interpolation or
+// directive is empty.
 func partIn(parts []types.Expression, next *int, from, to int) types.Expression {
 	for ; *next < len(parts); *next++ {
 		r := parts[*next].Range()
-		if r.Start.Byte >= from && r.End.Byte <= to {
+		if r.Start.Byte < r.End.Byte && r.Start.Byte >= from && r.End.Byte <= to {
 			*next++
 			return parts[*next-1]
 		}
@@ -711,7 +730,8 @@ func (c *converter) expr(expr hclsyntax.Expression) (types.Expression, error) {
 			}
 			start := item.KeyExpr.Range().Start
 			// Claim the item's own comments before those inside its value.
-			blockComment, inlineComment := c.leading(prevEndLine, start.Line), c.inline(start, limit)
+			blockComment := c.leading(prevEndLine, start.Line)
+			inlineComment, inlineInside := c.inline(start, limit)
 			key, err := c.expr(item.KeyExpr)
 			if err != nil {
 				return nil, err
@@ -724,6 +744,7 @@ func (c *converter) expr(expr hclsyntax.Expression) (types.Expression, error) {
 				Key:           key,
 				Value:         value,
 				InlineComment: inlineComment,
+				InlineInside:  inlineInside(),
 				BlockComment:  blockComment,
 				ExprRange:     hcl.RangeBetween(item.KeyExpr.Range(), item.ValueExpr.Range()),
 			}

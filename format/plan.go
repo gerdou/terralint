@@ -1,6 +1,7 @@
 package format
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 
@@ -24,6 +25,16 @@ func (o offSet) with(more offSet) offSet {
 		out[k] = true
 	}
 	return out
+}
+
+// String names the set, the same for equal sets.
+func (o offSet) String() string {
+	var rules []string
+	for r := range o {
+		rules = append(rules, r)
+	}
+	sort.Strings(rules)
+	return strings.Join(rules, " ")
 }
 
 // entry is a body item as it will be printed.
@@ -111,9 +122,20 @@ type marker struct {
 	off  offSet // the rules its ignore_<rule> words turn off
 }
 
+// commentText is the text of a stored comment line, without the marker
+// that a comment held whole keeps (see types.Root).
+func commentText(line string) string {
+	for _, m := range []string{"//", "#"} {
+		if rest, ok := strings.CutPrefix(line, m); ok {
+			return strings.TrimPrefix(rest, " ")
+		}
+	}
+	return line
+}
+
 // marker parses a stored comment line; nil if it is not a marker.
 func (f *formatter) marker(line string) *marker {
-	fields := strings.Fields(line)
+	fields := strings.Fields(commentText(line))
 	if len(fields) == 0 || fields[0] != f.cfg.SectionLabel {
 		return nil
 	}
@@ -143,22 +165,32 @@ func (s *commentScanner) whole(line string) bool {
 		s.inBlock = !strings.HasSuffix(t, "*/")
 		return false
 	}
-	if strings.HasPrefix(t, "/*") {
+	if strings.HasPrefix(line, "/*") {
 		s.inBlock = !strings.HasSuffix(t, "*/") || len(t) < 4
 		return false
 	}
 	return true
 }
 
-// planFile plans the file's body. It leaves the AST as it is.
+// planFile plans the file's body. It leaves the AST as it is. The file
+// header ends before a group of its comments that holds a marker: the marker
+// and the comments right above it belong to what follows.
 func (f *formatter) planFile() *plan {
 	children := f.root.Children
-	var header []string
-	if f.root.Header != "" && len(children) > 0 {
-		header = lines(f.root.Header)
+	f.header = nil
+	if len(children) > 0 {
+	groups:
+		for _, g := range f.root.HeaderGroups {
+			var scan commentScanner
+			for _, line := range lines(g) {
+				if scan.whole(line) && f.marker(line) != nil {
+					break groups
+				}
+			}
+			f.header = append(f.header, lines(g)...)
+		}
 	}
-	pl := f.planBody(children, f.root.EndComment, offSet{}, "", 0, len(header))
-	return pl
+	return f.planBody(children, f.root.EndComment, offSet{}, "", 0, len(f.header))
 }
 
 // planBody plans a body: it splits its items' leading comments into
@@ -175,7 +207,7 @@ func (f *formatter) planBody(children []types.Body, end string, off offSet, bloc
 		if cur == nil || !whole {
 			return false
 		}
-		t := strings.TrimSpace(line)
+		t := strings.TrimSpace(commentText(line))
 		if t == "}" && balance == 0 {
 			return true
 		}
@@ -274,11 +306,22 @@ func leadingComment(n types.Body) string {
 }
 
 // mergeLocals merges the file's locals blocks into the first of them, which
-// keeps its place. A block that the locals rule is off for, or that would
-// define a name twice, stays as it is.
+// keeps its place. Only blocks in the same section (or none) and with the
+// same rules off merge, so that every item stays under the markers it was
+// under. A block that the locals rule is off for, or that would define a
+// name twice, stays as it is.
 func (f *formatter) mergeLocals(pl *plan) {
-	var into *entry
-	names := map[string]bool{}
+	type target struct {
+		into  *entry
+		names map[string]bool
+	}
+	targets := map[string]*target{}
+	where := map[*entry]*section{}
+	for _, s := range pl.sections {
+		for _, e := range s.entries {
+			where[e] = s
+		}
+	}
 	all := pl.all()
 	sort.SliceStable(all, func(i, j int) bool { return start(all[i].node) < start(all[j].node) })
 	for _, e := range all {
@@ -286,9 +329,14 @@ func (f *formatter) mergeLocals(pl *plan) {
 		if !ok || b.Type != "locals" || !f.on(e.off, config.RuleLocals) {
 			continue
 		}
+		key := fmt.Sprintf("%p %s", where[e], e.off)
+		t := targets[key]
+		if t == nil {
+			t = &target{names: map[string]bool{}}
+		}
 		dup := false
 		for _, c := range b.Children {
-			if a, ok := c.(*types.Attribute); ok && names[a.Name] {
+			if a, ok := c.(*types.Attribute); ok && t.names[a.Name] {
 				dup = true
 			}
 		}
@@ -297,14 +345,15 @@ func (f *formatter) mergeLocals(pl *plan) {
 		}
 		for _, c := range b.Children {
 			if a, ok := c.(*types.Attribute); ok {
-				names[a.Name] = true
+				t.names[a.Name] = true
 			}
 		}
-		if into == nil {
-			into = e
+		if t.into == nil {
+			t.into = e
+			targets[key] = t
 			continue
 		}
-		f.mergeInto(pl, into, e)
+		f.mergeInto(pl, t.into, e)
 	}
 }
 
@@ -314,7 +363,9 @@ func (f *formatter) mergeInto(pl *plan, into, e *entry) {
 	dst, src := into.node.(*types.Block), e.node.(*types.Block)
 	dst.Children = append(dst.Children, src.Children...)
 	into.lead = append(into.lead, e.lead...)
-	into.lead = append(into.lead, lines(src.InlineComment)...)
+	if !src.InlineInside {
+		into.lead = append(into.lead, lines(src.InlineComment)...)
+	}
 	into.lead = append(into.lead, lines(src.TrailComment)...)
 
 	// Sections at the start of e's body follow what ends into's.

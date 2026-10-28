@@ -23,15 +23,22 @@ type printer struct {
 	// hoist receives the comments of the item being printed that have no
 	// line break to stay at: the printer puts them above the item.
 	hoist *[]string
+	// inlined counts the expressions printed with their comments in place,
+	// so that a call or list can tell whether an argument holds any.
+	inlined int
+	// endTail is the last tail comment printed in place, with the space
+	// before it, for arg.
+	endTail string
 }
 
 func (p *printer) on(rule string) bool { return p.cfg.On(rule) && !p.off[rule] }
 
 // ---- Comments ----
 
-// comments returns the output lines for stored comment text: with the
-// comments rule on, one # comment per line, a blank line becoming #;
-// otherwise line comments as # comments and /* */ comments as written.
+// comments returns the output lines for stored comment text (see
+// types.Root): # comments as written, // comments as # comments, and, with
+// the comments rule on, /* */ comments as # comments, one per line, a blank
+// line becoming #; with the rule off, /* */ comments as written.
 func (p *printer) comments(text string) []string {
 	if text == "" {
 		return nil
@@ -42,10 +49,15 @@ func (p *printer) comments(text string) []string {
 	for _, line := range strings.Split(text, "\n") {
 		t := strings.TrimRightFunc(line, unicode.IsSpace)
 		trimmed := strings.TrimSpace(t)
-		if block == nil && !strings.HasPrefix(trimmed, "/*") {
-			if t == "" {
+		if block == nil && !strings.HasPrefix(t, "/*") {
+			switch {
+			case strings.HasPrefix(t, "#"): // held whole: as written
+				out = append(out, t)
+			case strings.HasPrefix(t, "//"): // held whole: # for //
+				out = append(out, strings.TrimSpace("# "+strings.TrimPrefix(t[2:], " ")))
+			case t == "":
 				out = append(out, "#")
-			} else {
+			default:
 				out = append(out, "# "+t)
 			}
 			continue
@@ -122,7 +134,7 @@ func place(above []string, text string, inline, trail []string) string {
 func (p *printer) file(f *formatter, top *plan) []byte {
 	p.off = offSet{}
 	var parts []string
-	if header := p.comments(f.root.Header); len(header) > 0 {
+	if header := p.comments(strings.Join(f.header, "\n")); len(header) > 0 {
 		parts = append(parts, strings.Join(header, "\n"))
 	}
 	if body := p.body(f, top); body != "" {
@@ -174,8 +186,8 @@ func (p *printer) body(f *formatter, pl *plan) string {
 	p.off = save
 	if len(end) > 0 {
 		sep := "\n"
-		if pl.top && out != "" {
-			sep = "\n\n"
+		if pl.top {
+			sep += strings.Repeat("\n", p.cfg.BlankLinesBeforeFileEndComments)
 		}
 		if out == "" {
 			sep = ""
@@ -266,7 +278,7 @@ func (p *printer) entry(f *formatter, pl *plan, e *entry) chunk {
 	switch n := e.node.(type) {
 	case *types.Attribute:
 		text = n.Name + " = " + p.value(n, pl)
-		inline, trail = p.comments(n.InlineComment), p.comments(n.TrailComment)
+		inline, trail = p.inline(n.InlineComment, n.InlineInside), p.comments(n.TrailComment)
 	case *types.Block:
 		if n.Type == "" { // a file of comments only
 			return chunk{text: strings.Join(above, "\n"), entry: e}
@@ -282,13 +294,22 @@ func (p *printer) entry(f *formatter, pl *plan, e *entry) chunk {
 		} else {
 			text = head + " {\n" + inner + "\n}"
 		}
-		inline, trail = p.comments(n.InlineComment), p.comments(n.TrailComment)
+		inline, trail = p.inline(n.InlineComment, n.InlineInside), p.comments(n.TrailComment)
 	}
 	return chunk{
 		text:  place(append(above, hoisted...), text, inline, trail),
 		multi: strings.Contains(strings.TrimSuffix(text, "\n"), "\n"),
 		entry: e,
 	}
+}
+
+// inline returns the lines of an item's inline comment, unless an item
+// inside it holds the comment too and prints it.
+func (p *printer) inline(text string, inside bool) []string {
+	if inside {
+		return nil
+	}
+	return p.comments(text)
 }
 
 // value prints an attribute's value, with two rewrites `terraform fmt`
@@ -302,9 +323,10 @@ func (p *printer) value(a *types.Attribute, pl *plan) string {
 	}
 	if t, ok := a.Value.(*types.TemplateExpr); ok {
 		if pieces := p.text[t]; len(pieces) == 1 && pieces[0].Kind == "interp" {
+			n := p.inlined
 			s := p.sub(pieces[0].Expr, false)
 			if strings.Contains(s, "\n") && !(strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")")) {
-				s = "(" + s + ")"
+				s = p.wrap(n, "(", s, ")") // as the parentheses print on the next run
 			}
 			return p.withComments(a.Value, s, false)
 		}
@@ -353,19 +375,32 @@ func exprComments(e types.Expression) *types.ExprComments {
 	return &types.ExprComments{}
 }
 
+// withComments puts e's comments around s, its text. Where line breaks are
+// allowed, a tail comment ends the line s ends on, so the next token starts
+// a new line; the others go on lines of their own above s. Otherwise they
+// go above the item.
 func (p *printer) withComments(e types.Expression, s string, nl bool) string {
 	c := exprComments(e)
 	if c.LeadComment == "" && c.TailComment == "" {
 		return s
 	}
-	ls := append(p.comments(c.LeadComment), p.comments(c.TailComment)...)
+	lead, tail := p.comments(c.LeadComment), p.comments(c.TailComment)
 	if !nl {
 		if p.hoist != nil {
-			*p.hoist = append(*p.hoist, ls...)
+			*p.hoist = append(*p.hoist, append(lead, tail...)...)
 		}
 		return s
 	}
-	return "\n" + strings.Join(ls, "\n") + "\n" + s
+	p.inlined++
+	if len(tail) > 0 && !strings.HasSuffix(s, "\n") && !strings.Contains(tail[0], "\n") {
+		p.endTail = " " + tail[0]
+		s += p.endTail + "\n"
+		tail = tail[1:]
+	}
+	if above := append(lead, tail...); len(above) > 0 {
+		s = "\n" + strings.Join(above, "\n") + "\n" + strings.TrimPrefix(s, "\n")
+	}
+	return s
 }
 
 // expr prints e without its own comments. nl tells whether a line break is
@@ -401,7 +436,8 @@ func (p *printer) expr(e types.Expression, nl bool) string {
 	case *types.IndexExpr:
 		return p.postfixSource(e.Collection, nl) + "[" + p.sub(e.Key, false) + "]"
 	case *types.ParenExpr:
-		return "(" + closeLine(p.sub(e.Expression, true)) + ")"
+		n := p.inlined
+		return p.wrap(n, "(", p.sub(e.Expression, true), ")")
 	case *types.UnaryExpr:
 		return e.Operator + p.sub(e.Expr, nl)
 	case *types.BinaryExpr:
@@ -409,25 +445,25 @@ func (p *printer) expr(e types.Expression, nl bool) string {
 	case *types.ConditionalExpr:
 		return p.sub(e.Condition, nl) + " ? " + p.sub(e.TrueExpr, nl) + " : " + p.sub(e.FalseExpr, nl)
 	case *types.ForArrayExpr:
-		s := "[for " + forVars(e.KeyVar, e.ValueVar) + " in " + p.sub(e.Collection, true) + " : "
-		last := p.sub(e.ThenValueExpr, true)
+		n := p.inlined
+		s := "for " + forVars(e.KeyVar, e.ValueVar) + " in " + p.sub(e.Collection, true) + " : " + p.sub(e.ThenValueExpr, true)
 		if e.Condition != nil {
-			s, last = s+last+" if ", p.sub(e.Condition, true)
+			s += " if " + p.sub(e.Condition, true)
 		}
-		return s + closeLine(last) + "]"
+		return p.wrap(n, "[", s, "]")
 	case *types.ForMapExpr:
-		s := "{ for " + forVars(e.KeyVar, e.ValueVar) + " in " + p.sub(e.Collection, true) + " : " + p.sub(e.ThenKeyExpr, true) + " => "
-		last := p.sub(e.ThenValueExpr, true)
+		n := p.inlined
+		s := "for " + forVars(e.KeyVar, e.ValueVar) + " in " + p.sub(e.Collection, true) + " : " + p.sub(e.ThenKeyExpr, true) + " => " + p.sub(e.ThenValueExpr, true)
 		if e.Group {
-			last += "..."
+			s += "..."
 		}
 		if e.Condition != nil {
-			s, last = s+last+" if ", p.sub(e.Condition, true)
+			s += " if " + p.sub(e.Condition, true)
 		}
-		if strings.HasPrefix(last, "\n") {
-			return s + last + "\n}"
+		if p.inlined == n {
+			return "{ " + s + " }"
 		}
-		return s + last + " }"
+		return p.wrap(n, "{", s, "}")
 	case *types.FunctionCallExpr:
 		return p.call(e)
 	case *types.ArrayExpr:
@@ -447,13 +483,15 @@ func (p *printer) expr(e types.Expression, nl bool) string {
 	panic(fmt.Sprintf("format: cannot print %T", e))
 }
 
-// closeLine puts the closing bracket after s on a line of its own when s
-// starts with comment lines.
-func closeLine(s string) string {
-	if strings.HasPrefix(s, "\n") {
-		return s + "\n"
+// wrap returns s between open and close. When comments were printed in
+// place in s (p.inlined moved past n), s goes on lines of its own: a comment
+// that ended the line open is on would read as its item's own on the next
+// run.
+func (p *printer) wrap(n int, open, s, close string) string {
+	if p.inlined == n {
+		return open + s + close
 	}
-	return s
+	return open + "\n" + strings.Trim(s, "\n") + "\n" + close
 }
 
 func forVars(key, value string) string {
@@ -466,9 +504,10 @@ func forVars(key, value string) string {
 // postfixSource prints what a traversal, splat or index applies to; a splat
 // needs parentheses there, or the step would join the splat.
 func (p *printer) postfixSource(e types.Expression, nl bool) string {
+	n := p.inlined
 	s := p.sub(e, nl)
 	if _, ok := e.(*types.SplatExpr); ok {
-		s = "(" + s + ")"
+		s = p.wrap(n, "(", s, ")") // as the parentheses print on the next run
 	}
 	return s
 }
@@ -531,11 +570,14 @@ func (p *printer) template(e types.Expression) (string, bool) {
 		case "close":
 			b.WriteString(pc.Text + "\n")
 		case "interp":
-			b.WriteString(open + closeLine(p.sub(pc.Expr, true)) + close)
+			n := p.inlined
+			b.WriteString(p.wrap(n, open, p.sub(pc.Expr, true), close))
 		case "if":
-			b.WriteString(open + "if " + closeLine(p.sub(pc.Expr, true)) + close)
+			n := p.inlined
+			b.WriteString(p.wrap(n, open+"if", " "+p.sub(pc.Expr, true), close))
 		case "for":
-			b.WriteString(open + "for " + forVars(pc.For.KeyVar, pc.For.ValueVar) + " in " + closeLine(p.sub(pc.For.Collection, true)) + close)
+			n := p.inlined
+			b.WriteString(p.wrap(n, open+"for "+forVars(pc.For.KeyVar, pc.For.ValueVar)+" in", " "+p.sub(pc.For.Collection, true), close))
 		default: // else, endif, endfor
 			b.WriteString(open + pc.Kind + close)
 		}
@@ -558,20 +600,23 @@ func (p *printer) templateParts(parts []types.Expression) string {
 				continue
 			}
 		}
-		b.WriteString("${" + p.sub(part, true) + "}")
+		n := p.inlined
+		b.WriteString(p.wrap(n, "${", p.sub(part, true), "}"))
 	}
 	return b.String()
 }
 
-// list prints a list on one line when it has no comments, no element that
-// spans lines, and fits the configured width; else one element per line.
+// list prints a list on one line when it has no comments (its elements'
+// included), no element that spans lines, and fits the configured width;
+// else one element per line.
 func (p *printer) list(a *types.ArrayExpr) string {
-	elems := make([]string, len(a.Items))
+	elems, ends := make([]string, len(a.Items)), make([]string, len(a.Items))
 	commented, multi := a.EndComment != "", false
 	for i, x := range a.Items {
-		elems[i] = p.expr(x, true)
+		n := p.inlined
+		elems[i], ends[i] = p.arg(x)
 		c := exprComments(x)
-		commented = commented || c.LeadComment != "" || c.TailComment != ""
+		commented = commented || c.LeadComment != "" || c.TailComment != "" || p.inlined > n
 		multi = multi || strings.Contains(elems[i], "\n")
 	}
 	one := "[" + strings.Join(elems, ", ") + "]"
@@ -585,7 +630,7 @@ func (p *printer) list(a *types.ArrayExpr) string {
 	var b strings.Builder
 	b.WriteString("[\n")
 	for i, x := range a.Items {
-		b.WriteString(p.element(x, elems[i], ","))
+		b.WriteString(p.element(x, elems[i], ends[i], ","))
 	}
 	if end := p.comments(a.EndComment); len(end) > 0 {
 		b.WriteString(strings.Join(end, "\n") + "\n")
@@ -594,13 +639,29 @@ func (p *printer) list(a *types.ArrayExpr) string {
 	return b.String()
 }
 
+// arg prints a list element or call argument without its own comments. It
+// splits off the comment printed in place that ends it, if any: that
+// comment goes after the separator, where it reads as the element's own on
+// the next run.
+func (p *printer) arg(x types.Expression) (s, end string) {
+	p.endTail = ""
+	s = p.expr(x, true)
+	if p.endTail != "" && strings.HasSuffix(s, p.endTail+"\n") {
+		return strings.TrimSuffix(s, p.endTail+"\n"), p.endTail[1:]
+	}
+	return s, ""
+}
+
 // element prints a list element or argument on its own lines, with its
-// comments, followed by sep.
-func (p *printer) element(x types.Expression, s, sep string) string {
+// comments and end, the comment arg split off, followed by sep.
+func (p *printer) element(x types.Expression, s, end, sep string) string {
 	c := exprComments(x)
 	above := p.comments(c.LeadComment)
 	tail := p.comments(c.TailComment)
-	line := s + sep // after a heredoc, sep starts the line below its closing marker
+	if end != "" {
+		tail = append([]string{end}, tail...)
+	}
+	line := strings.TrimPrefix(s, "\n") + sep // after a heredoc, sep starts the line below its closing marker
 	if len(tail) == 1 && !strings.Contains(tail[0], "\n") && !strings.HasSuffix(line, "\n") {
 		line += " " + tail[0]
 	} else {
@@ -616,15 +677,16 @@ func (p *printer) element(x types.Expression, s, sep string) string {
 	return out
 }
 
-// call prints a function call: arguments on one line, unless one has
+// call prints a function call: arguments on one line, unless one holds
 // comments or one before the last spans lines; then one per line.
 func (p *printer) call(f *types.FunctionCallExpr) string {
-	args := make([]string, len(f.Args))
+	args, ends := make([]string, len(f.Args)), make([]string, len(f.Args))
 	commented, multi := f.EndComment != "", false
 	for i, x := range f.Args {
-		args[i] = p.expr(x, true)
+		n := p.inlined
+		args[i], ends[i] = p.arg(x)
 		c := exprComments(x)
-		commented = commented || c.LeadComment != "" || c.TailComment != ""
+		commented = commented || c.LeadComment != "" || c.TailComment != "" || p.inlined > n
 		multi = multi || i < len(f.Args)-1 && strings.Contains(args[i], "\n")
 	}
 	expand := ""
@@ -641,7 +703,7 @@ func (p *printer) call(f *types.FunctionCallExpr) string {
 		if i == len(f.Args)-1 && f.ExpandFinal {
 			sep = expand
 		}
-		b.WriteString(p.element(x, args[i], sep))
+		b.WriteString(p.element(x, args[i], ends[i], sep))
 	}
 	if end := p.comments(f.EndComment); len(end) > 0 {
 		b.WriteString(strings.Join(end, "\n") + "\n")
@@ -674,7 +736,7 @@ func (p *printer) objectItem(it *types.ObjectItem) string {
 	p.hoist = &hoisted
 	text := p.sub(it.Key, false) + " = " + p.sub(it.Value, false)
 	p.hoist = save
-	return place(append(p.comments(it.BlockComment), hoisted...), text, p.comments(it.InlineComment), p.comments(it.TrailComment))
+	return place(append(p.comments(it.BlockComment), hoisted...), text, p.inline(it.InlineComment, it.InlineInside), p.comments(it.TrailComment))
 }
 
 // keyText is how an object key sorts: its name, its string, or its text.

@@ -69,46 +69,122 @@ func (f *formatter) name(s string) string {
 	return strings.ReplaceAll(s, f.cfg.Naming.Replace, f.cfg.Naming.With)
 }
 
-// rename applies the naming rule to every item it is on for: attribute
-// names, block types, the labels that name things, and everything in
-// expressions that is a name (see renameExpr).
+// rename applies the naming rule: to attribute names, block types, the
+// labels that name things, and everything in expressions that is a name
+// (see renameExpr). Items the rule is off for keep their own names, but
+// their references to names declared elsewhere are renamed, so that they
+// still match.
 func (f *formatter) rename(top *plan) {
 	if f.cfg.Naming.Replace == "" {
 		return
 	}
-	visit(top, func(e *entry, _ *plan) {
-		if !f.on(e.off, config.RuleNaming) {
-			return
-		}
+	f.renamePlan(top, nil)
+}
+
+// renamePlan renames in a body. kept holds the iterator names of the
+// dynamic blocks around it that keep their names.
+func (f *formatter) renamePlan(pl *plan, kept map[string]bool) {
+	for _, e := range pl.all() {
+		on := f.on(e.off, config.RuleNaming)
 		switch n := e.node.(type) {
 		case *types.Attribute:
-			if !f.exempt.names[n.Name] {
+			// A .tfvars file sets variables: an exempt one keeps its name there too.
+			if f.tfvars && pl.top && f.exempt.covers([]string{"var", n.Name}) {
+				on = false
+			}
+			if on && !f.exempt.names[n.Name] {
 				n.Name = f.name(n.Name)
 			}
-			f.renameExpr(n.Value)
+			f.renameExpr(n.Value, on, kept)
 		case *types.Block:
-			n.Type = f.name(n.Type)
-			if i, ok := f.cfg.Naming.Labels[n.Type]; ok && i < len(n.Labels) {
-				labels := append([]string{}, n.Labels...)
-				labels[i] = f.name(labels[i])
-				n.Labels = labels
+			inner := kept
+			if on {
+				n.Type = f.name(n.Type)
+				if i, ok := f.cfg.Naming.Labels[n.Type]; ok && i < len(n.Labels) {
+					labels := append([]string{}, n.Labels...)
+					labels[i] = f.name(labels[i])
+					n.Labels = labels
+				}
+			} else if n.Type == "dynamic" && len(n.Labels) > 0 {
+				inner = with(kept, n.Labels[0])
+				for _, c := range n.Children {
+					if a, ok := c.(*types.Attribute); ok && a.Name == "iterator" {
+						if r, ok := a.Value.(*types.ReferenceExpr); ok && len(r.Parts) == 1 {
+							inner = with(inner, r.Parts[0])
+						}
+					}
+				}
 			}
+			f.renamePlan(e.plan, inner)
 		}
-	})
+	}
+}
+
+// with returns kept with more names.
+func with(kept map[string]bool, names ...string) map[string]bool {
+	out := map[string]bool{}
+	for k := range kept {
+		out[k] = true
+	}
+	for _, n := range names {
+		out[n] = true
+	}
+	return out
+}
+
+// rootRef returns the reference a chain of traversals, indexes and splats
+// starts from, or nil.
+func rootRef(e types.Expression) *types.ReferenceExpr {
+	for {
+		switch x := e.(type) {
+		case *types.ReferenceExpr:
+			return x
+		case *types.RelativeTraversalExpr:
+			e = x.Source
+		case *types.IndexExpr:
+			e = x.Collection
+		case *types.SplatExpr:
+			e = x.Source
+		default:
+			return nil
+		}
+	}
 }
 
 // renameExpr renames, in e: every step of a reference (unless the reference
-// is to a name an ignore_naming marker keeps), for-expression variables,
-// and unquoted object keys. Quoted text is never renamed.
-func (f *formatter) renameExpr(e types.Expression) {
+// starts with a name an ignore_naming marker keeps, or one in kept),
+// for-expression variables, and unquoted object keys. Quoted text is never
+// renamed. When on is false, the rule is off for e's item: its
+// for-expression variables (and so the references to them) and its object
+// keys stay.
+func (f *formatter) renameExpr(e types.Expression, on bool, kept map[string]bool) {
+	if !on {
+		walk(e, func(x types.Expression) {
+			switch x := x.(type) {
+			case *types.ForArrayExpr:
+				kept = with(kept, x.KeyVar, x.ValueVar)
+			case *types.ForMapExpr:
+				kept = with(kept, x.KeyVar, x.ValueVar)
+			}
+		})
+	}
+	keeps := func(ref *types.ReferenceExpr) bool {
+		return ref != nil && (f.exempt.covers(ref.Parts) || len(ref.Parts) == 1 && f.exempt.names[ref.Parts[0]] || kept[ref.Parts[0]])
+	}
 	skip := map[types.Expression]bool{}
 	walk(e, func(x types.Expression) {
 		if skip[x] {
 			return
 		}
 		switch x := x.(type) {
+		case *types.ObjectExpr:
+			for _, item := range x.Items {
+				if k, ok := item.Key.(*types.ReferenceExpr); ok && len(k.Parts) == 1 && !on {
+					skip[k] = true
+				}
+			}
 		case *types.ReferenceExpr:
-			if f.exempt.covers(x.Parts) || len(x.Parts) == 1 && f.exempt.names[x.Parts[0]] {
+			if keeps(x) {
 				return
 			}
 			parts := make([]string, len(x.Parts))
@@ -117,18 +193,22 @@ func (f *formatter) renameExpr(e types.Expression) {
 			}
 			x.Parts = parts
 		case *types.RelativeTraversalExpr:
-			if ref, ok := x.Source.(*types.ReferenceExpr); ok && f.exempt.covers(ref.Parts) {
+			if keeps(rootRef(x.Source)) {
 				return
 			}
 			f.renameSteps(x.Traversal)
 		case *types.SplatExpr:
-			if ref, ok := x.Source.(*types.ReferenceExpr); ok && f.exempt.covers(ref.Parts) {
+			if keeps(rootRef(x.Source)) {
 				walk(x.Each, func(y types.Expression) { skip[y] = true })
 			}
 		case *types.ForArrayExpr:
-			x.KeyVar, x.ValueVar = f.name(x.KeyVar), f.name(x.ValueVar)
+			if on {
+				x.KeyVar, x.ValueVar = f.name(x.KeyVar), f.name(x.ValueVar)
+			}
 		case *types.ForMapExpr:
-			x.KeyVar, x.ValueVar = f.name(x.KeyVar), f.name(x.ValueVar)
+			if on {
+				x.KeyVar, x.ValueVar = f.name(x.KeyVar), f.name(x.ValueVar)
+			}
 		}
 	})
 }
@@ -215,30 +295,39 @@ func (f *formatter) priority(pl *plan) config.Priority {
 	return f.cfg.Priorities[pl.blockType]
 }
 
+// key places an item in its body. Within a priority group, as among other
+// items, top-level blocks sort by type and labels, nested blocks by type
+// only (stable, so blocks of one type keep their order), attributes by name.
 func (f *formatter) key(n types.Body, p config.Priority, top bool) sortKey {
 	block, isBlock := n.(*types.Block)
-	name := ""
-	if isBlock {
-		name = block.Type
-		if o, i, ok := locate(name, p.PrependedBlocks); ok {
-			return sortKey{group: 0, outer: o, inner: i}
-		}
-	} else {
+	name, sortName := "", ""
+	switch {
+	case !isBlock:
 		name = n.(*types.Attribute).Name
+		sortName = name
+	case top:
+		name = block.Type
+		sortName = strings.Join(append([]string{block.Type}, block.Labels...), " ")
+	default:
+		name = block.Type
+		sortName = effectiveType(block)
+	}
+	sortName = strings.ToLower(sortName)
+	if isBlock {
+		if o, i, ok := locate(name, p.PrependedBlocks); ok {
+			return sortKey{group: 0, outer: o, inner: i, name: sortName}
+		}
 	}
 	if o, i, ok := locate(name, p.Prepended); ok {
-		return sortKey{group: 1, outer: o, inner: i}
+		return sortKey{group: 1, outer: o, inner: i, name: sortName}
 	}
 	if o, i, ok := locate(name, p.Appended); ok {
-		return sortKey{group: 4, outer: -o, inner: i}
+		return sortKey{group: 4, outer: -o, inner: i, name: sortName}
 	}
 	if !isBlock {
-		return sortKey{group: 2, name: strings.ToLower(name)}
+		return sortKey{group: 2, name: sortName}
 	}
-	if top {
-		return sortKey{group: 3, name: strings.ToLower(strings.Join(append([]string{block.Type}, block.Labels...), " "))}
-	}
-	return sortKey{group: 3, name: strings.ToLower(effectiveType(block))}
+	return sortKey{group: 3, name: sortName}
 }
 
 // effectiveType is the type a nested block sorts by: dynamic "x" is an x.

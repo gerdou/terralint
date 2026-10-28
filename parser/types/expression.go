@@ -15,7 +15,15 @@ type Expression interface {
 // holds. Every expression type embeds it.
 type ExprComments struct {
 	LeadComment string // The comments between the previous part of the enclosing expression and this one, one per line
-	TailComment string // The comments after this expression on the line it ends, one per line
+	// TailComment holds the comments after this expression on the line it
+	// ends, one per line. When this expression is the last part of an
+	// enclosing expression other than a list, call or object, it also holds
+	// the comments on later lines up to the end of that expression, even
+	// those before tokens that hold no comments: in b = var.list[, then a
+	// comment line, then 0], the comment is var.list's TailComment, though
+	// it comes before the index. A comment inside an expression that has no
+	// parts, such as between the steps of a reference, is its TailComment.
+	TailComment string
 }
 
 // Comments returns the expression's comments, for code that handles every
@@ -50,6 +58,7 @@ type ObjectItem struct {
 	Key           Expression
 	Value         Expression
 	InlineComment string // The first comment on the item's first line, after its start and before the next item or the closing brace
+	InlineInside  bool   // InlineComment is also the InlineComment of an object item inside the value that starts on the same line; it follows that item
 	BlockComment  string // The comments on the lines between the previous item (or the opening brace) and this one, one per line
 	TrailComment  string // The comments after the item on its last line, besides InlineComment
 	ExprRange     hcl.Range

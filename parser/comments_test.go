@@ -16,7 +16,8 @@ import (
 
 // heldComments returns every comment text the AST holds, from every field
 // whose name ends in Comment. Root.Header is left out: it repeats the start
-// of the first item's BlockComment. Root.Text is a map and is not walked.
+// of the first item's BlockComment. So is an InlineComment that InlineInside
+// says an item inside holds too. Root.Text is a map and is not walked.
 func heldComments(v reflect.Value, out *[]string) {
 	switch v.Kind() {
 	case reflect.Interface, reflect.Ptr:
@@ -30,6 +31,9 @@ func heldComments(v reflect.Value, out *[]string) {
 		for i := 0; i < v.NumField(); i++ {
 			f := v.Type().Field(i)
 			if f.Type.Kind() == reflect.String && strings.HasSuffix(f.Name, "Comment") {
+				if inside := v.FieldByName("InlineInside"); f.Name == "InlineComment" && inside.IsValid() && inside.Bool() {
+					continue
+				}
 				if s := v.Field(i).String(); s != "" {
 					*out = append(*out, s)
 				}
@@ -212,6 +216,91 @@ func TestTemplateText(t *testing.T) {
 	for _, p := range root.Text[value(0)] {
 		if p.Kind == "for" && (p.For == nil || p.For.KeyVar != "k" || p.For.ValueVar != "v") {
 			t.Errorf("for directive: %+v", p.For)
+		}
+	}
+}
+
+// A comment on a line where an item opens and another item inside it starts
+// is the InlineComment of both; InlineInside marks the outer copy.
+func TestInlineInside(t *testing.T) {
+	src := `locals {
+  tags = { Name = "x" # name tag
+    Env = "y"
+  }
+  b = { c = { d = 1 /* deep */ } }
+}
+resource "a" "b" {
+  lifecycle { create_before_destroy = true /* why */ }
+}
+`
+	root := parseSource(t, src)
+	checkHeld(t, "inline inside", []byte(src), root)
+	locals := root.Children[0].(*types.Block).Children
+	tags, b := locals[0].(*types.Attribute), locals[1].(*types.Attribute)
+	name := tags.Value.(*types.ObjectExpr).Items[0]
+	c := b.Value.(*types.ObjectExpr).Items[0]
+	d := c.Value.(*types.ObjectExpr).Items[0]
+	lifecycle := root.Children[1].(*types.Block).Children[0].(*types.Block)
+	create := lifecycle.Children[0].(*types.Attribute)
+	for _, x := range []struct {
+		what   string
+		inline string
+		inside bool
+		want   string
+	}{
+		{"tags", tags.InlineComment, tags.InlineInside, "name tag"},
+		{"Name", name.InlineComment, !name.InlineInside, "name tag"},
+		{"b", b.InlineComment, b.InlineInside, "/* deep */"},
+		{"c", c.InlineComment, c.InlineInside, "/* deep */"},
+		{"d", d.InlineComment, !d.InlineInside, "/* deep */"},
+		{"lifecycle", lifecycle.InlineComment, lifecycle.InlineInside, "/* why */"},
+		{"create_before_destroy", create.InlineComment, !create.InlineInside, "/* why */"},
+	} {
+		if x.inline != x.want || !x.inside {
+			t.Errorf("%s: inline %q (InlineInside as expected: %v), want %q", x.what, x.inline, x.inside, x.want)
+		}
+	}
+}
+
+// How comments are held: a # or // comment without its marker and one
+// space, unless that text would read as another comment.
+func TestCommentText(t *testing.T) {
+	for _, c := range []struct{ src, want string }{
+		{"# note", "note"},
+		{"// note", "note"},
+		{"#   indented", "  indented"},
+		{"#####", "#####"},
+		{"### Network ###", "### Network ###"},
+		{"#x", "#x"},
+		{"//x", "//x"},
+		{"#", "#"},
+		{"# # x", "# # x"},
+		{"# // x", "# // x"},
+		{"# /* x */", "# /* x */"},
+		{"#  */", " */"},
+		{"/* x */", "/* x */"},
+	} {
+		if got := stripCommentPrefix(c.src + "\n"); got != c.want {
+			t.Errorf("%q is held as %q, want %q", c.src, got, c.want)
+		}
+	}
+}
+
+// An indented heredoc whose first line is a directive: HCL leaves an empty
+// literal before the directive.
+func TestHeredocOpeningDirective(t *testing.T) {
+	for _, c := range []struct{ src, want string }{
+		{"locals {\n  c = <<-EOT\n    %{ for ip in var.ips ~}\n    server ${ip}\n    %{ endfor ~}\n  EOT\n}\n", "text for text interp text endfor text close"},
+		{"locals {\n  c = <<-EOT\n    %{ if var.header }\n    header\n    %{ else }\n    none\n    %{ endif }\n  EOT\n}\n", "text if text else text endif text close"},
+	} {
+		root := parseSource(t, c.src)
+		h := root.Children[0].(*types.Block).Children[0].(*types.Attribute).Value
+		var kinds []string
+		for _, p := range root.Text[h] {
+			kinds = append(kinds, p.Kind)
+		}
+		if got := strings.Join(kinds, " "); got != c.want {
+			t.Errorf("pieces %q, want %q", got, c.want)
 		}
 	}
 }
