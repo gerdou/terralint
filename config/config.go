@@ -7,6 +7,7 @@ package config
 const (
 	RuleOrdering   = "ordering"    // Body items in priority, then A-Z, order
 	RuleObjectKeys = "object_keys" // Object keys A-Z
+	RuleObjects    = "objects"     // Objects with items one item per line (off: as written, one line or not)
 	RuleNaming     = "naming"      // '-' becomes '_' in names
 	RuleComments   = "comments"    // Comments become # comments, one per line
 	RuleLocals     = "locals"      // A file's locals blocks merge into one
@@ -50,7 +51,11 @@ type Naming struct {
 	Replace string `yaml:"replace"`
 	With    string `yaml:"with"`
 	// Labels gives, by block type, the index of the label that names the
-	// block (the second label of a resource; the first of a variable).
+	// block (the second label of a resource; the first of a variable), which
+	// is where Terraform puts the name. A type left out keeps its names, and
+	// so do the references to them in every file of the directory; without
+	// "variable" or "output", so do .tfvars assignments and module call
+	// arguments, or the outputs read from a module call.
 	Labels map[string]int `yaml:"labels"`
 }
 
@@ -98,6 +103,7 @@ func Default() *Config {
 		Rules: map[string]bool{
 			RuleOrdering:   true,
 			RuleObjectKeys: true,
+			RuleObjects:    true,
 			RuleNaming:     true,
 			RuleComments:   true,
 			RuleLocals:     true,

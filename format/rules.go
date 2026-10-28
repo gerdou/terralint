@@ -88,11 +88,19 @@ func (f *formatter) renamePlan(pl *plan, kept map[string]bool) {
 		on := f.on(e.off, config.RuleNaming)
 		switch n := e.node.(type) {
 		case *types.Attribute:
-			// A .tfvars file sets variables: an exempt one keeps its name there too.
-			if f.tfvars && pl.top && f.exempt.covers([]string{"var", n.Name}) {
-				on = false
+			// The assignments of a .tfvars file and the arguments of a module
+			// call are named after variables: they keep the names those keep.
+			// An exempt variable's assignment keeps its object keys too.
+			name := on
+			switch {
+			case f.tfvars && pl.top:
+				held, deep := f.exempt.covers([]string{"var", n.Name})
+				on = on && !deep
+				name = on && held == 0 && f.renames("variable")
+			case pl.blockType == "module" && pl.depth == 1:
+				name = on && f.renames("variable") // the child module's variables
 			}
-			if on && !f.exempt.names[n.Name] {
+			if name && !f.exempt.names[n.Name] {
 				n.Name = f.name(n.Name)
 			}
 			f.renameExpr(n.Value, on, kept)
@@ -100,10 +108,13 @@ func (f *formatter) renamePlan(pl *plan, kept map[string]bool) {
 			inner := kept
 			if on {
 				n.Type = f.name(n.Type)
-				if i, ok := f.cfg.Naming.Labels[n.Type]; ok && i < len(n.Labels) {
+				// A declaration that a marker elsewhere exempts keeps its name.
+				if i, ok := f.cfg.Naming.Labels[n.Type]; ok && i < len(n.Labels) && !(pl.top && f.exempted(declares(n))) {
 					labels := append([]string{}, n.Labels...)
 					labels[i] = f.name(labels[i])
 					n.Labels = labels
+				} else if !ok && n.Type == "dynamic" && len(n.Labels) > 0 {
+					inner = with(kept, n.Labels[0])
 				}
 			} else if n.Type == "dynamic" && len(n.Labels) > 0 {
 				inner = with(kept, n.Labels[0])
@@ -118,6 +129,13 @@ func (f *formatter) renamePlan(pl *plan, kept map[string]bool) {
 			f.renamePlan(e.plan, inner)
 		}
 	}
+}
+
+// exempted reports whether an exemption covers the references that start
+// with p.
+func (f *formatter) exempted(p []string) bool {
+	n, _ := f.exempt.covers(p)
+	return p != nil && n > 0
 }
 
 // with returns kept with more names.
@@ -151,8 +169,8 @@ func rootRef(e types.Expression) *types.ReferenceExpr {
 	}
 }
 
-// renameExpr renames, in e: every step of a reference (unless the reference
-// starts with a name an ignore_naming marker keeps, or one in kept),
+// renameExpr renames, in e: every step of a reference (but the names an
+// exemption keeps, and those of references that start with a name in kept),
 // for-expression variables, and unquoted object keys. Quoted text is never
 // renamed. When on is false, the rule is off for e's item: its
 // for-expression variables (and so the references to them) and its object
@@ -168,8 +186,25 @@ func (f *formatter) renameExpr(e types.Expression, on bool, kept map[string]bool
 			}
 		})
 	}
-	keeps := func(ref *types.ReferenceExpr) bool {
-		return ref != nil && (f.exempt.covers(ref.Parts) || len(ref.Parts) == 1 && f.exempt.names[ref.Parts[0]] || kept[ref.Parts[0]])
+	outputs := f.renames("output")
+	// renamed returns the names of ref that are renamed, parts[from:to],
+	// and whether the steps after it are. After module.<name> come the
+	// child module's outputs, which keep their names when outputs do.
+	renamed := func(ref *types.ReferenceExpr) (from, to int, steps bool) {
+		switch {
+		case ref == nil:
+			return 0, 0, true
+		case kept[ref.Parts[0]] || len(ref.Parts) == 1 && f.exempt.names[ref.Parts[0]]:
+			return 0, 0, false
+		}
+		n, deep := f.exempt.covers(ref.Parts)
+		switch {
+		case deep:
+			return 0, 0, false
+		case ref.Parts[0] == "module" && !outputs:
+			return n, min(len(ref.Parts), 2), false
+		}
+		return n, len(ref.Parts), true
 	}
 	skip := map[types.Expression]bool{}
 	walk(e, func(x types.Expression) {
@@ -184,21 +219,18 @@ func (f *formatter) renameExpr(e types.Expression, on bool, kept map[string]bool
 				}
 			}
 		case *types.ReferenceExpr:
-			if keeps(x) {
-				return
-			}
-			parts := make([]string, len(x.Parts))
-			for i, p := range x.Parts {
-				parts[i] = f.name(p)
+			from, to, _ := renamed(x)
+			parts := append([]string{}, x.Parts...)
+			for i := from; i < to; i++ {
+				parts[i] = f.name(parts[i])
 			}
 			x.Parts = parts
 		case *types.RelativeTraversalExpr:
-			if keeps(rootRef(x.Source)) {
-				return
+			if _, _, steps := renamed(rootRef(x.Source)); steps {
+				f.renameSteps(x.Traversal)
 			}
-			f.renameSteps(x.Traversal)
 		case *types.SplatExpr:
-			if keeps(rootRef(x.Source)) {
+			if _, _, steps := renamed(rootRef(x.Source)); !steps {
 				walk(x.Each, func(y types.Expression) { skip[y] = true })
 			}
 		case *types.ForArrayExpr:

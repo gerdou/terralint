@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/gerdou/terralint/config"
 	"github.com/gerdou/terralint/format"
@@ -29,7 +30,9 @@ func isTerraformFile(path string) bool {
 
 // forEachFile runs fn on path, or, when path is a directory, once on every
 // regular .tf and .tfvars file under it. Symbolic links under it are not
-// followed. It goes on past failures and returns all of them.
+// followed, nor are files and directories whose name starts with ".", which
+// Terraform ignores (.terraform/ holds downloaded modules). It goes on past
+// failures and returns all of them.
 func forEachFile(path string, fn func(string) error) error {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -44,7 +47,14 @@ func forEachFile(path string, fn func(string) error) error {
 	var errs []error
 	// The trailing separator makes WalkDir follow path itself when it is a
 	// link to a directory; links inside it are still skipped.
-	err = filepath.WalkDir(path+string(filepath.Separator), func(p string, d fs.DirEntry, err error) error {
+	root := path + string(filepath.Separator)
+	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if p != root && d != nil && strings.HasPrefix(d.Name(), ".") {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		if err != nil {
 			errs = append(errs, err)
 		} else if d.Type().IsRegular() && isTerraformFile(p) {

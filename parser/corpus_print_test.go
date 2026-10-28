@@ -3,7 +3,7 @@ package parser
 // printExpr renders an AST expression back to HCL source for the fidelity
 // gate. It must work from the AST fields alone: never from source text or
 // ranges. Keep it in step with the types in parser/types. Comments
-// (ExprComments, EndComment, TrailComment) and Root.Text do not change what
+// (ExprComments, OpenComment, EndComment, TrailComment) and Root.Text do not change what
 // an expression means, so it prints neither; "${x}" is a TemplateExpr whose
 // only part is x, which it prints as written.
 

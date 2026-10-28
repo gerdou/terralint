@@ -132,3 +132,34 @@ func TestCLI(t *testing.T) {
 		t.Errorf("apply -d wrote through a symbolic link to outside.tf")
 	}
 }
+
+// Directory mode skips files and directories whose name starts with ".",
+// below the given directory, as Terraform does (.terraform/ holds downloaded
+// modules); a dot-named directory given itself is walked.
+func TestCLIHidden(t *testing.T) {
+	dir := t.TempDir()
+	unsorted := "variable \"b\" {}\n\nvariable \"a\" {}\n"
+	write(t, filepath.Join(dir, "main.tf"), validTF)
+	hidden := []string{
+		filepath.Join(dir, ".terraform", "modules", "vpc", "variables.tf"),
+		filepath.Join(dir, "sub", ".x.tf"),
+		filepath.Join(dir, ".bad.tf"),
+	}
+	for _, p := range hidden[:2] {
+		write(t, p, unsorted)
+	}
+	write(t, hidden[2], invalidTF)
+	for _, cmd := range []string{"check", "apply"} {
+		if code, stdout, stderr := runCLI(t, cmd, "-d", dir); code != 0 || stdout != "" || stderr != "" {
+			t.Errorf("%s -d: exit %d, stdout %q, stderr %q; want 0 and silent", cmd, code, stdout, stderr)
+		}
+	}
+	for _, p := range hidden[:2] {
+		if got, _ := os.ReadFile(p); string(got) != unsorted {
+			t.Errorf("apply -d changed %s: %q", p, got)
+		}
+	}
+	if code, _, stderr := runCLI(t, "check", "-d", filepath.Join(dir, ".terraform")); code != 1 || !strings.Contains(stderr, "variables.tf") {
+		t.Errorf("check -d .terraform: exit %d, stderr %q; want 1 naming variables.tf", code, stderr)
+	}
+}

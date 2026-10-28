@@ -29,6 +29,9 @@ type printer struct {
 	// endTail is the last tail comment printed in place, with the space
 	// before it, for arg.
 	endTail string
+	// inTemplate is set while printing the expressions of a template's
+	// interpolations and directives.
+	inTemplate bool
 }
 
 func (p *printer) on(rule string) bool { return p.cfg.On(rule) && !p.off[rule] }
@@ -548,6 +551,9 @@ func (p *printer) template(e types.Expression) (string, bool) {
 		}
 		return ""
 	}
+	save := p.inTemplate
+	p.inTemplate = true
+	defer func() { p.inTemplate = save }()
 	var b strings.Builder
 	h, heredoc := e.(*types.HeredocExpr)
 	if heredoc {
@@ -591,6 +597,9 @@ func (p *printer) template(e types.Expression) (string, bool) {
 // templateParts prints template parts that have no recorded text, as
 // HCL's parse sees them.
 func (p *printer) templateParts(parts []types.Expression) string {
+	save := p.inTemplate
+	p.inTemplate = true
+	defer func() { p.inTemplate = save }()
 	var b strings.Builder
 	for _, part := range parts {
 		if l, ok := part.(*types.LiteralValue); ok && l.ValueType == "string" {
@@ -607,8 +616,8 @@ func (p *printer) templateParts(parts []types.Expression) string {
 }
 
 // list prints a list on one line when it has no comments (its elements'
-// included), no element that spans lines, and fits the configured width;
-// else one element per line.
+// included), no element that spans lines, and fits the configured width
+// (any width inside a template interpolation); else one element per line.
 func (p *printer) list(a *types.ArrayExpr) string {
 	elems, ends := make([]string, len(a.Items)), make([]string, len(a.Items))
 	commented, multi := a.EndComment != "", false
@@ -621,7 +630,10 @@ func (p *printer) list(a *types.ArrayExpr) string {
 	}
 	one := "[" + strings.Join(elems, ", ") + "]"
 	fits := len(one) <= p.cfg.ListWidth
-	if !p.on(config.RuleLists) {
+	switch {
+	case p.inTemplate: // terraform fmt would dedent the lines after it
+		fits = true
+	case !p.on(config.RuleLists):
 		fits = a.ExprRange.Start.Line == a.ExprRange.End.Line
 	}
 	if !commented && !multi && fits {
@@ -712,16 +724,36 @@ func (p *printer) call(f *types.FunctionCallExpr) string {
 	return b.String()
 }
 
-// object prints an object one item per line; {} when it is empty.
+// object prints an object one item per line; {} when it is empty. It is on
+// one line, when it has no comments and no item spans lines, inside a
+// template interpolation (where terraform fmt would dedent the lines after
+// it) or, with the objects rule off, when it was on one line.
 func (p *printer) object(o *types.ObjectExpr) string {
-	end := p.comments(o.EndComment)
+	open, end := p.comments(o.OpenComment), p.comments(o.EndComment)
 	if len(o.Items) == 0 && len(end) == 0 {
 		return "{}"
 	}
-	var b strings.Builder
-	b.WriteString("{\n")
+	items := make([]string, len(o.Items))
+	one := len(open) == 0 && len(end) == 0 &&
+		(p.inTemplate || !p.on(config.RuleObjects) && o.ExprRange.Start.Line == o.ExprRange.End.Line)
 	for i := range o.Items {
-		b.WriteString(p.objectItem(&o.Items[i]) + "\n")
+		var commented bool
+		items[i], commented = p.objectItem(&o.Items[i])
+		one = one && !commented && !strings.Contains(items[i], "\n")
+	}
+	if one {
+		return "{ " + strings.Join(items, ", ") + " }"
+	}
+	var b strings.Builder
+	b.WriteString("{")
+	if len(open) > 0 {
+		// It ends the brace's line, so the next run reads it back here.
+		p.inlined++
+		b.WriteString(" " + strings.Join(open, "\n"))
+	}
+	b.WriteString("\n")
+	for _, item := range items {
+		b.WriteString(item + "\n")
 	}
 	if len(end) > 0 {
 		b.WriteString(strings.Join(end, "\n") + "\n")
@@ -730,13 +762,18 @@ func (p *printer) object(o *types.ObjectExpr) string {
 	return b.String()
 }
 
-func (p *printer) objectItem(it *types.ObjectItem) string {
+// objectItem prints an object item with its comments, and tells whether it
+// has any.
+func (p *printer) objectItem(it *types.ObjectItem) (string, bool) {
 	save := p.hoist
 	var hoisted []string
 	p.hoist = &hoisted
+	n := p.inlined
 	text := p.sub(it.Key, false) + " = " + p.sub(it.Value, false)
 	p.hoist = save
-	return place(append(p.comments(it.BlockComment), hoisted...), text, p.inline(it.InlineComment, it.InlineInside), p.comments(it.TrailComment))
+	above := append(p.comments(it.BlockComment), hoisted...)
+	inline, trail := p.inline(it.InlineComment, it.InlineInside), p.comments(it.TrailComment)
+	return place(above, text, inline, trail), len(above)+len(inline)+len(trail) > 0 || p.inlined > n
 }
 
 // keyText is how an object key sorts: its name, its string, or its text.

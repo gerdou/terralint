@@ -406,6 +406,9 @@ func (c *converter) attachObject(o *types.ObjectExpr, cs []int) {
 			buckets[k] = append(buckets[k], i)
 		case k > 0 && tok.Range.Start.Line == o.Items[k-1].Value.Range().End.Line:
 			appendComment(&o.Items[k-1].TrailComment, c.join([]int{i}))
+		case k == 0 && len(o.Items) > 0 && tok.Range.Start.Line == o.ExprRange.Start.Line && tok.Range.Start.Line < o.Items[0].Key.Range().Start.Line:
+			// On the opening brace's line: about the whole object.
+			appendComment(&o.OpenComment, c.join([]int{i}))
 		case k < len(o.Items):
 			key := o.Items[k].Key.(commented).Comments()
 			appendComment(&key.LeadComment, c.join([]int{i}))
@@ -594,7 +597,13 @@ func (c *converter) templateText(rng hcl.Range, parts []types.Expression) ([]typ
 					return nil, fmt.Errorf("no expression for the interpolation at %s", tok.Range)
 				}
 			} else {
-				p.Kind = string(c.tokens[i+1].Bytes)
+				// The keyword is the first token after %{ that is not a line
+				// break or a comment.
+				k := i + 1
+				for k < end && (c.tokens[k].Type == hclsyntax.TokenNewline || c.tokens[k].Type == hclsyntax.TokenComment) {
+					k++
+				}
+				p.Kind = string(c.tokens[k].Bytes)
 				switch p.Kind {
 				case "if":
 					d, _ := partIn(top.parts, &top.next, tok.Range.Start.Byte, rng.End.Byte).(*types.ConditionalExpr)
@@ -604,6 +613,9 @@ func (c *converter) templateText(rng hcl.Range, parts []types.Expression) ([]typ
 					p.Expr = d.Condition
 					stack = append(stack, &frame{parts: templateParts(d.TrueExpr), cond: d})
 				case "else":
+					if top.cond == nil {
+						return nil, fmt.Errorf("no if directive for the else at %s", tok.Range)
+					}
 					top.parts, top.next = templateParts(top.cond.FalseExpr), 0
 				case "for":
 					t, _ := partIn(top.parts, &top.next, tok.Range.Start.Byte, rng.End.Byte).(*types.TemplateExpr)

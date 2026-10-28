@@ -272,7 +272,7 @@ resource "aws_s3_bucket" "my-b" {}
     var.my-var,
     var.other_var,
     local.my-local,
-    module.my-mod.out-x,
+    module.my-mod.out_x,
     aws_s3_bucket.my-b.id,
   ]
 }
@@ -942,4 +942,358 @@ resource "a" "y" {}
 resource "a" "y" {}
 # end of file
 `)
+}
+
+func TestRound2Naming(t *testing.T) {
+	// ignore_naming on a module call keeps the call's name; its arguments
+	// and the outputs read from it follow the child module, whose variables
+	// and outputs are renamed. A marker on an argument keeps that one
+	// (R2b-002).
+	check(t, nil, `# terralint ignore_naming
+module "vpc-main" {
+  source     = "./modules/vpc"
+  cidr-block = "10.0.0.0/16"
+  # terralint ignore_naming
+  dashed-arg = { my-key = 1 }
+}
+
+output "o" {
+  value = [module.vpc-main.vpc-id, module.vpc-main["a"].vpc-id, [for m in module.vpc-main : m.vpc-id]]
+}
+`, `# terralint ignore_naming
+module "vpc-main" {
+  source = "./modules/vpc"
+
+  cidr_block = "10.0.0.0/16"
+
+  # terralint ignore_naming
+  dashed-arg = {
+    my-key = 1
+  }
+}
+
+output "o" {
+  value = [
+    module.vpc-main.vpc_id,
+    module.vpc-main["a"].vpc_id,
+    [for m in module.vpc-main : m.vpc_id],
+  ]
+}
+`)
+
+	// ignore_naming on a .tfvars assignment exempts the variable it sets,
+	// in every file of the directory (R2b-004).
+	files := map[string]string{
+		"main.tf": `output "o" {
+  value = var.instance-type
+}
+
+variable "instance-type" {}
+`,
+		"terraform.tfvars": `# terralint ignore_naming
+instance-type = "t3.micro"
+`,
+	}
+	if got := formatSource(t, config.Default(), "main.tf", files); got != files["main.tf"] {
+		t.Errorf("main.tf:\n%s\nwant:\n%s", got, files["main.tf"])
+	}
+	if got := formatSource(t, config.Default(), "terraform.tfvars", files); got != files["terraform.tfvars"] {
+		t.Errorf("terraform.tfvars:\n%s\nwant:\n%s", got, files["terraform.tfvars"])
+	}
+
+	// A block type missing from Naming.Labels keeps its names, and the
+	// references to them keep theirs too (R2b-003).
+	src := `provider "google-beta" {}
+
+module "vpc-main" {
+  source     = "./x"
+  cidr-block = var.my-var
+}
+
+resource "google_x" "y" {
+  provider = google-beta
+  v        = [module.vpc-main.out-x, var.my-var.sub-key]
+}
+
+variable "my-var" {}
+`
+	for _, tt := range []struct{ drop, want string }{
+		{"provider", `provider "google-beta" {}
+
+module "vpc_main" {
+  source = "./x"
+
+  cidr_block = var.my_var
+}
+
+resource "google_x" "y" {
+  provider = google-beta
+
+  v = [module.vpc_main.out_x, var.my_var.sub_key]
+}
+
+variable "my_var" {}
+`},
+		{"module", `provider "google_beta" {}
+
+module "vpc-main" {
+  source = "./x"
+
+  cidr_block = var.my_var
+}
+
+resource "google_x" "y" {
+  provider = google_beta
+
+  v = [module.vpc-main.out_x, var.my_var.sub_key]
+}
+
+variable "my_var" {}
+`},
+		{"variable", `provider "google_beta" {}
+
+module "vpc_main" {
+  source = "./x"
+
+  cidr-block = var.my-var
+}
+
+resource "google_x" "y" {
+  provider = google_beta
+
+  v = [module.vpc_main.out_x, var.my-var.sub_key]
+}
+
+variable "my-var" {}
+`},
+		{"output", `provider "google_beta" {}
+
+module "vpc_main" {
+  source = "./x"
+
+  cidr_block = var.my_var
+}
+
+resource "google_x" "y" {
+  provider = google_beta
+
+  v = [module.vpc_main.out-x, var.my_var.sub_key]
+}
+
+variable "my_var" {}
+`},
+	} {
+		cfg := config.Default()
+		delete(cfg.Naming.Labels, tt.drop)
+		if got := formatSource(t, cfg, "main.tf", map[string]string{"main.tf": src}); got != tt.want {
+			t.Errorf("without %s labels:\n%s\nwant:\n%s", tt.drop, got, tt.want)
+		}
+	}
+	cfg := config.Default()
+	delete(cfg.Naming.Labels, "dynamic")
+	check(t, cfg, `resource "a" "b" {
+  dynamic "my-rule" {
+    for_each = var.rules
+    content {
+      id = my-rule.value
+    }
+  }
+}
+`, `resource "a" "b" {
+  dynamic "my-rule" {
+    for_each = var.rules
+
+    content {
+      id = my-rule.value
+    }
+  }
+}
+`)
+	cfg = config.Default()
+	delete(cfg.Naming.Labels, "variable")
+	if got, want := formatSource(t, cfg, "a.tfvars", map[string]string{"a.tfvars": "my-var = { my-key = 1 }\n"}), "my-var = {\n  my_key = 1\n}\n"; got != want {
+		t.Errorf("without variable labels, a.tfvars:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestRound2Layout(t *testing.T) {
+	// Inside a template interpolation, objects and lists print on one line,
+	// whatever their width, so terraform fmt keeps the lines after it
+	// indented; one that holds a comment still spans lines (R1a-005, D10).
+	check(t, nil, `resource "aws_instance" "web" {
+  ami       = "ami-123"
+  user_data = <<-EOT
+    echo '${jsonencode({
+      port = 80
+      long = ["aaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccccccc"]
+    })}'
+  EOT
+  name      = "${jsonencode({ b = 1 /* why */ })}-x"
+  tags = {
+    Name = "web"
+  }
+}
+`, `resource "aws_instance" "web" {
+  ami = "ami-123"
+
+  name = "${jsonencode({
+    b = 1 # why
+  })}-x"
+
+  user_data = <<-EOT
+    echo '${jsonencode({ long = ["aaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccccccc"], port = 80 })}'
+  EOT
+
+  tags = {
+    Name = "web"
+  }
+}
+`)
+
+	// With the objects rule off, for the file or for an item, an object
+	// keeps the shape it was written in (R2b-005).
+	src := `locals {
+  a = { Name = "web", Env = "prod" }
+  b = {
+    x = 1
+  }
+}
+`
+	cfg := config.Default()
+	cfg.Rules[config.RuleObjects] = false
+	check(t, cfg, src, `locals {
+  a = { Env = "prod", Name = "web" }
+
+  b = {
+    x = 1
+  }
+}
+`)
+	check(t, nil, `locals {
+  # terralint ignore_objects ignore_object_keys
+  a = { Name = "web", Env = "prod" }
+  b = { x = 1 }
+}
+`, `locals {
+  # terralint ignore_objects ignore_object_keys
+  a = { Name = "web", Env = "prod" }
+
+  b = {
+    x = 1
+  }
+}
+`)
+}
+
+func TestRound2Comments(t *testing.T) {
+	// A comment on the opening brace line of an object that does not start
+	// an item belongs to the object, and stays on that line when its keys
+	// sort (R2a-003, R2c-002).
+	check(t, nil, `locals {
+  rules = [
+    { # HTTPS from anywhere
+      rule = "https-443-tcp"
+      cidr = "0.0.0.0/0"
+    },
+  ]
+  all = concat(
+    var.extra,
+    [
+      { /* allow HTTPS */
+        port = 443
+        cidr = "0.0.0.0/0"
+      },
+    ],
+  )
+  by_key = {
+    for k, v in var.m : k => { # obj
+      z = v
+      a = v
+    }
+  }
+  two = [
+    { /* one */ /* two */
+      z = 1
+      a = 2
+    },
+  ]
+}
+`, `locals {
+  all = concat(
+    var.extra,
+    [
+      { # allow HTTPS
+        cidr = "0.0.0.0/0"
+        port = 443
+      },
+    ],
+  )
+
+  by_key = {
+    for k, v in var.m : k => { # obj
+      a = v
+      z = v
+    }
+  }
+
+  rules = [
+    { # HTTPS from anywhere
+      cidr = "0.0.0.0/0"
+      rule = "https-443-tcp"
+    },
+  ]
+
+  two = [
+    { # one
+      # two
+      a = 2
+      z = 1
+    },
+  ]
+}
+`)
+}
+
+func TestRound2Templates(t *testing.T) {
+	// A line break or a comment may come between %{ and the directive's
+	// keyword (R2a-002).
+	check(t, nil, `locals {
+  a = <<-EOT
+    %{~
+      if length(var.extra) > 0
+    ~}
+    extra
+    %{~ endif ~}
+  EOT
+  b = "%{
+  if var.x }yes%{ else }no%{ endif }"
+  c = <<EOT
+%{ for x in var.xs
+}${x}
+%{
+endfor }
+EOT
+}
+`, `locals {
+  a = <<-EOT
+    %{~if length(var.extra) > 0~}
+    extra
+    %{~endif~}
+  EOT
+
+  b = "%{if var.x}yes%{else}no%{endif}"
+
+  c = <<EOT
+%{for x in var.xs}${x}
+%{endfor}
+EOT
+}
+`)
+	got := formatSource(t, config.Default(), "main.tf", map[string]string{"main.tf": `locals {
+  a = "%{ /* c */ if var.x }yes%{ else }no%{ endif }"
+}
+`})
+	if !strings.Contains(got, "%{if var.x}yes%{else}no%{endif}") || !strings.Contains(got, "# c") {
+		t.Errorf("comment before a directive keyword:\n%s", got)
+	}
 }

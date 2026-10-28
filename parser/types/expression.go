@@ -49,9 +49,10 @@ func (l *LiteralValue) Range() hcl.Range {
 // ObjectExpr represents object/map expressions
 type ObjectExpr struct {
 	ExprComments
-	Items      []ObjectItem
-	EndComment string // The comments after the last item (or the opening brace, when there is none), on their own lines, one per line
-	ExprRange  hcl.Range
+	Items       []ObjectItem
+	OpenComment string // The comments on the opening brace's line, after it, when the first item starts on a later line and no enclosing item holds them as its InlineComment, one per line
+	EndComment  string // The comments after the last item (or the opening brace, when there is none), on their own lines, one per line
+	ExprRange   hcl.Range
 }
 
 type ObjectItem struct {

@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/gerdou/terralint/config"
 	"github.com/gerdou/terralint/parser"
@@ -54,21 +55,37 @@ func (f *formatter) on(off offSet, rule string) bool {
 	return f.cfg.On(rule) && !off[rule]
 }
 
-// exemptions are the names that ignore_naming markers keep, in the whole
-// directory: references that start with one of prefixes, and the provider
-// names in names.
+// exemptions are the names that keep their dashes, in the whole directory:
+// those that ignore_naming markers keep, and those declared by blocks whose
+// type is not in Naming.Labels. References that start with one of prefixes
+// keep those names; the provider names in names keep theirs everywhere.
 type exemptions struct {
-	prefixes [][]string
+	prefixes []prefix
 	names    map[string]bool
 }
 
-// exemptions collects the names declared under ignore_naming in path and
-// the other .tf and .tfvars files of its directory. Files that do not
-// mention the marker word are not parsed; files that do not parse are
-// skipped.
+// prefix is the start of the references to an exempt name. When deep, the
+// steps after it keep their names too: an item under ignore_naming keeps
+// its object keys, which those steps name.
+type prefix struct {
+	parts []string
+	deep  bool
+}
+
+// declaring are the block types whose names references use (see declares).
+var declaring = []string{"variable", "module", "resource", "data", "ephemeral", "provider"}
+
+// exemptions collects the exempt names declared in path and the other .tf
+// and .tfvars files of its directory. Files that do not mention the marker
+// word are not parsed, unless a declaring block type is missing from
+// Naming.Labels; files that do not parse are skipped.
 func (f *formatter) exemptions(path string) *exemptions {
 	ex := &exemptions{names: map[string]bool{}}
 	word := []byte(f.cfg.IgnorePrefix + config.RuleNaming)
+	every := false
+	for _, t := range declaring {
+		every = every || !f.renames(t)
+	}
 	self, _ := os.Stat(path)
 	dir := filepath.Dir(path)
 	files, _ := os.ReadDir(dir)
@@ -82,7 +99,7 @@ func (f *formatter) exemptions(path string) *exemptions {
 			continue
 		}
 		src, err := os.ReadFile(other)
-		if err != nil || !bytes.Contains(src, word) {
+		if err != nil || !every && !bytes.Contains(src, word) {
 			continue
 		}
 		root := f.root
@@ -91,7 +108,7 @@ func (f *formatter) exemptions(path string) *exemptions {
 				continue
 			}
 		}
-		of := &formatter{cfg: f.cfg, root: root}
+		of := &formatter{cfg: f.cfg, root: root, tfvars: filepath.Ext(other) == ".tfvars"}
 		for _, e := range of.planFile().all() {
 			ex.collect(of, e)
 		}
@@ -99,27 +116,45 @@ func (f *formatter) exemptions(path string) *exemptions {
 	return ex
 }
 
-// collect records what a top-level entry declares under ignore_naming.
+// renames reports whether the naming rule renames the names that blocks of
+// this type declare.
+func (f *formatter) renames(blockType string) bool {
+	_, ok := f.cfg.Naming.Labels[blockType]
+	return ok
+}
+
+// collect records the exempt names a top-level entry declares: all of them
+// under ignore_naming, and those of a block type the rule does not rename.
+// Under ignore_naming, a .tfvars assignment exempts the variable it sets.
 func (ex *exemptions) collect(f *formatter, e *entry) {
-	if !f.on(e.off, config.RuleNaming) {
-		ex.add(e.node)
-		return
-	}
-	if b, ok := e.node.(*types.Block); ok && b.Type == "locals" {
-		for _, le := range e.plan.all() {
-			if a, ok := le.node.(*types.Attribute); ok && !f.on(le.off, config.RuleNaming) {
-				ex.prefixes = append(ex.prefixes, []string{"local", a.Name})
+	off := !f.on(e.off, config.RuleNaming)
+	switch n := e.node.(type) {
+	case *types.Attribute:
+		if off && f.tfvars {
+			ex.prefixes = append(ex.prefixes, prefix{[]string{"var", n.Name}, true})
+		}
+	case *types.Block:
+		if p := declares(n); p != nil && (off || !f.renames(n.Type)) {
+			// The steps after module.<name> are the child module's outputs,
+			// which follow the child's own declarations.
+			ex.prefixes = append(ex.prefixes, prefix{p, off && n.Type != "module"})
+			if n.Type == "provider" {
+				ex.names[p[0]] = true
+			}
+		}
+		if n.Type == "locals" {
+			for _, le := range e.plan.all() {
+				if a, ok := le.node.(*types.Attribute); ok && !f.on(le.off, config.RuleNaming) {
+					ex.prefixes = append(ex.prefixes, prefix{[]string{"local", a.Name}, true})
+				}
 			}
 		}
 	}
 }
 
-// add records the names a top-level item declares.
-func (ex *exemptions) add(n types.Body) {
-	b, ok := n.(*types.Block)
-	if !ok {
-		return
-	}
+// declares returns how references start that name what a top-level block
+// declares (var.<name>, <type>.<name>, ...), or nil.
+func declares(b *types.Block) []string {
 	label := func(i int) string {
 		if i < len(b.Labels) {
 			return b.Labels[i]
@@ -128,40 +163,26 @@ func (ex *exemptions) add(n types.Body) {
 	}
 	switch b.Type {
 	case "variable":
-		ex.prefixes = append(ex.prefixes, []string{"var", label(0)})
+		return []string{"var", label(0)}
 	case "module":
-		ex.prefixes = append(ex.prefixes, []string{"module", label(0)})
+		return []string{"module", label(0)}
 	case "resource":
-		ex.prefixes = append(ex.prefixes, []string{label(0), label(1)})
+		return []string{label(0), label(1)}
 	case "data", "ephemeral":
-		ex.prefixes = append(ex.prefixes, []string{b.Type, label(0), label(1)})
+		return []string{b.Type, label(0), label(1)}
 	case "provider":
-		ex.prefixes = append(ex.prefixes, []string{label(0)})
-		ex.names[label(0)] = true
-	case "locals":
-		for _, c := range b.Children {
-			if a, ok := c.(*types.Attribute); ok {
-				ex.prefixes = append(ex.prefixes, []string{"local", a.Name})
-			}
-		}
+		return []string{label(0)}
 	}
+	return nil
 }
 
-// covers reports whether a reference with these parts is exempt.
-func (ex *exemptions) covers(parts []string) bool {
+// covers returns how many leading parts of a reference an exemption keeps,
+// and whether it keeps the steps after them too.
+func (ex *exemptions) covers(parts []string) (n int, deep bool) {
 	for _, p := range ex.prefixes {
-		if len(p) <= len(parts) {
-			match := true
-			for i := range p {
-				if p[i] != parts[i] {
-					match = false
-					break
-				}
-			}
-			if match {
-				return true
-			}
+		if len(p.parts) <= len(parts) && slices.Equal(p.parts, parts[:len(p.parts)]) {
+			n, deep = max(n, len(p.parts)), deep || p.deep
 		}
 	}
-	return false
+	return n, deep
 }
