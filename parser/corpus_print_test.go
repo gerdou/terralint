@@ -49,7 +49,11 @@ func printExpr(e types.Expression) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return e.Name + "(" + strings.Join(args, ", ") + ")", nil
+		expand := ""
+		if e.ExpandFinal {
+			expand = "..."
+		}
+		return e.Name + "(" + strings.Join(args, ", ") + expand + ")", nil
 	case *types.ObjectExpr:
 		var b strings.Builder
 		b.WriteString("{\n")
@@ -68,8 +72,6 @@ func printExpr(e types.Expression) (string, error) {
 		return b.String(), nil
 	case *types.ArrayExpr:
 		return printTuple(e.Items)
-	case *types.TupleExpr:
-		return printTuple(e.Expressions)
 	case *types.BinaryExpr:
 		l, err := printExpr(e.Left)
 		if err != nil {
@@ -135,16 +137,24 @@ func printExpr(e types.Expression) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return "{" + head + " : " + kv[0] + " => " + kv[1] + cond + "}", nil
+		group := ""
+		if e.Group {
+			group = "..."
+		}
+		return "{" + head + " : " + kv[0] + " => " + kv[1] + group + cond + "}", nil
 	case *types.SplatExpr:
 		src, err := printPostfixSource(e.Source)
 		if err != nil {
 			return "", err
 		}
-		if e.Each != nil {
-			return "", fmt.Errorf("splat with an Each expression %T", e.Each)
+		each, err := printExpr(e.Each)
+		if err != nil {
+			return "", err
 		}
-		return src + "[*]", nil
+		return src + "[*]" + each, nil
+	case *types.SplatItemExpr:
+		// The splat element: the steps applied to it follow the [*].
+		return "", nil
 	case *types.TemplateExpr:
 		body, err := printTemplateBody(e.Parts)
 		if err != nil {
@@ -152,7 +162,11 @@ func printExpr(e types.Expression) (string, error) {
 		}
 		return `"` + body + `"`, nil
 	case *types.HeredocExpr:
-		return `"` + escapeTemplateLiteral(e.Content) + `"`, nil
+		body, err := printTemplateBody(e.Parts)
+		if err != nil {
+			return "", err
+		}
+		return `"` + body + `"`, nil
 	}
 	return "", fmt.Errorf("cannot print %T", e)
 }
@@ -235,9 +249,6 @@ func printLiteral(l *types.LiteralValue) (string, error) {
 	case nil:
 		return "null", nil
 	case string:
-		if l.ValueType == "dynamic" || l.ValueType == "null" {
-			return "null", nil
-		}
 		if l.ValueType == "number" {
 			return v, nil
 		}
@@ -284,36 +295,6 @@ func printTemplateBody(parts []types.Expression) (string, error) {
 					continue
 				}
 			}
-		case *types.TemplateForDirective:
-			head, err := printForHead(p.KeyVar, p.ValueVar, p.CollExpr)
-			if err != nil {
-				return "", err
-			}
-			inner, err := printTemplateBody(p.Content)
-			if err != nil {
-				return "", err
-			}
-			b.WriteString("%{" + head + "}" + inner + "%{endfor}")
-			continue
-		case *types.TemplateIfDirective:
-			c, err := printExpr(p.Condition)
-			if err != nil {
-				return "", err
-			}
-			t, err := printTemplateBody(p.TrueExpr)
-			if err != nil {
-				return "", err
-			}
-			b.WriteString("%{if " + c + "}" + t)
-			if len(p.FalseExpr) > 0 {
-				f, err := printTemplateBody(p.FalseExpr)
-				if err != nil {
-					return "", err
-				}
-				b.WriteString("%{else}" + f)
-			}
-			b.WriteString("%{endif}")
-			continue
 		}
 		s, err := printExpr(p)
 		if err != nil {

@@ -12,6 +12,7 @@ var applyCmd = &cobra.Command{
 	Long:  `Modifies the terraform files passed in'`,
 	Args:  validateArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		cmd.SilenceUsage = true // the arguments are valid; the usage text would not help
 		return internal.Apply(terraformPath)
 	},
 }

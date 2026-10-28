@@ -1,54 +1,53 @@
 package internal
 
 import (
+	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 )
 
-func Apply(filePath string) error {
-	fileInfo, err := os.Stat(filePath)
-
-	if err != nil {
-		return err
-	}
-
-	if fileInfo.IsDir() {
-		return applyRulesToDirectory(filePath)
-	}
-	return applyRulesToFile(filePath)
-}
-
-func applyRulesToFile(filePath string) error {
-	extension := filepath.Ext(filePath)
-
-	if extension != ".tf" && extension != ".tfvars" {
-		return nil
-	}
-	formattedBytes, err := getFormattedContent(filePath)
-
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(filePath, formattedBytes, 0666)
-}
-
-func applyRulesToDirectory(directoryPath string) error {
-	err := filepath.WalkDir(directoryPath, func(path string, d fs.DirEntry, err error) error {
+// Apply rewrites every file under path to follow the rules.
+func Apply(path string) error {
+	return forEachFile(path, func(filePath string) error {
+		formattedBytes, err := getFormattedContent(filePath)
 		if err != nil {
 			return err
 		}
-		if path == directoryPath {
-			return nil
-		}
-		if d.IsDir() {
-			return applyRulesToDirectory(path)
-		}
-		return applyRulesToFile(path)
+		return os.WriteFile(filePath, formattedBytes, 0666)
 	})
+}
+
+func isTerraformFile(path string) bool {
+	ext := filepath.Ext(path)
+	return ext == ".tf" || ext == ".tfvars"
+}
+
+// forEachFile runs fn on path, or, when path is a directory, once on every
+// regular .tf and .tfvars file under it. Symbolic links are not followed. It
+// goes on past failures and returns all of them.
+func forEachFile(path string, fn func(string) error) error {
+	info, err := os.Stat(path)
 	if err != nil {
 		return err
 	}
-	return nil
+	if !info.IsDir() {
+		if !isTerraformFile(path) {
+			return fmt.Errorf("%s: not a .tf or .tfvars file", path)
+		}
+		return fn(path)
+	}
+	var errs []error
+	err = filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			errs = append(errs, err)
+		} else if d.Type().IsRegular() && isTerraformFile(p) {
+			if err := fn(p); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		return nil
+	})
+	return errors.Join(append(errs, err)...)
 }

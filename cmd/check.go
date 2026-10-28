@@ -13,6 +13,7 @@ var checkCmd = &cobra.Command{
 locations where any of the builtin rules are violated.`,
 	Args: validateArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		cmd.SilenceUsage = true // the arguments are valid; the usage text would not help
 		return internal.Check(terraformPath)
 	},
 }

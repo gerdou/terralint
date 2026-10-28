@@ -1,18 +1,16 @@
 package internal
 
 import (
-	"github.com/gerdou/terralint/parser"
 	"os"
+
+	"github.com/gerdou/terralint/parser"
 )
 
+// getFormattedContent parses the file and returns its content with the rules
+// applied. No rule exists yet, so the content comes back unchanged.
 func getFormattedContent(filePath string) ([]byte, error) {
-	root, err := parser.ParseTerraformFile(filePath)
-	root = root
-	if err != nil {
+	if _, err := parser.ParseTerraformFile(filePath); err != nil {
 		return nil, err
 	}
-
-	// For now, just return the original file content
-	// In the future, we can implement formatting based on the parsed AST
 	return os.ReadFile(filePath)
 }

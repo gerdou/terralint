@@ -24,6 +24,9 @@ var rootCmd = &cobra.Command{
 			fmt.Println(version.Version)
 			return nil
 		}
+		if terraformFilePath != "" || terraformDirectoryPath != "" {
+			return errors.New("the -f and -d flags need a command: check or apply")
+		}
 
 		return cmd.Help()
 	},
@@ -45,6 +48,9 @@ func init() {
 }
 
 func validateArgs(cmd *cobra.Command, args []string) error {
+	if len(args) > 0 {
+		return fmt.Errorf("unexpected arguments %q: give one file with -f or one directory with -d", args)
+	}
 	if terraformFilePath == "" && terraformDirectoryPath == "" {
 		return errors.New("exactly one of the command flags should be set")
 	}

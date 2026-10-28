@@ -10,10 +10,10 @@ type Expression interface {
 	Range() hcl.Range
 }
 
-// LiteralValue represents primitive values (string, number, bool)
+// LiteralValue represents primitive values (string, number, bool, null)
 type LiteralValue struct {
-	Value     interface{} // The actual value
-	ValueType string      // Type of the value (string, number, bool)
+	Value     interface{} // string, bool, int64 (whole numbers), float64 (other numbers), or nil for null
+	ValueType string      // "string", "number", "bool" or "null"
 	ExprRange hcl.Range
 }
 
@@ -34,8 +34,8 @@ type ObjectExpr struct {
 type ObjectItem struct {
 	Key           Expression
 	Value         Expression
-	InlineComment string
-	BlockComment  string // Added to capture block comments
+	InlineComment string // The first comment on the item's first line, after its start and before the next item or the closing brace
+	BlockComment  string // The comments on the lines between the previous item (or the opening brace) and this one, one per line
 	ExprRange     hcl.Range
 }
 
@@ -85,9 +85,10 @@ func (r *ReferenceExpr) Range() hcl.Range {
 
 // FunctionCallExpr represents function calls
 type FunctionCallExpr struct {
-	Name      string
-	Args      []Expression
-	ExprRange hcl.Range
+	Name        string // The full name, including any namespace (e.g. "provider::aws::arn_parse")
+	Args        []Expression
+	ExpandFinal bool // The last argument ends in "..." and its elements are passed as separate arguments
+	ExprRange   hcl.Range
 }
 
 func (f *FunctionCallExpr) ExpressionType() string {
@@ -100,7 +101,7 @@ func (f *FunctionCallExpr) Range() hcl.Range {
 
 // TemplateExpr represents string interpolation
 type TemplateExpr struct {
-	Parts     []Expression // Mix of LiteralValue, TemplateForDirective, TemplateIfDirective, and other expressions
+	Parts     []Expression // String LiteralValues and interpolated expressions. A %{if} directive is a ConditionalExpr whose results are templates; a %{for} directive is a TemplateExpr holding one ForArrayExpr
 	ExprRange hcl.Range
 }
 
@@ -144,21 +145,22 @@ func (b *BinaryExpr) Range() hcl.Range {
 	return b.ExprRange
 }
 
-// ForMapExpr represents for expressions: [for x in xs : upper(x)] or {for k, v in map : k => v}
+// ForMapExpr represents for expressions that build an object: {for k, v in map : k => v}
 type ForMapExpr struct {
 	// Iterator variables
-	ValueVar string // The value variable name (e.g. "v" in "for k, v in map")
-	KeyVar   string // The key variable for maps (e.g., "k" in "for k, v in map" or "x" in "for x in xs")
+	ValueVar string // The value variable ("v" in "for k, v in map", "x" in "for x in xs")
+	KeyVar   string // The key variable ("k" in "for k, v in map"), empty when only one variable is given
 
 	// Collection being iterated
 	Collection Expression // The collection being iterated over (e.g., "xs" in "for x in xs")
 
 	// Result expressions
-	ThenKeyExpr   Expression // The value expression (e.g., "k" in "for k, v in map : k => v")
-	ThenValueExpr Expression // The value expression for map outputs (e.g., "v" in "for k, v in map : k => v")
+	ThenKeyExpr   Expression // The key expression ("k" in "for k, v in map : k => v")
+	ThenValueExpr Expression // The value expression ("v" in "for k, v in map : k => v")
 
 	// Filtering and grouping
 	Condition Expression // Optional "if" condition (e.g., "x != null" in "for x in xs : x if x != null")
+	Group     bool       // The value expression ends in "...": values with the same key are grouped into a list
 
 	// Source location
 	ExprRange hcl.Range
@@ -172,17 +174,17 @@ func (f *ForMapExpr) Range() hcl.Range {
 	return f.ExprRange
 }
 
-// ForArrayExpr represents for expressions: [for x in xs : upper(x)]
+// ForArrayExpr represents for expressions that build a tuple: [for x in xs : upper(x)]
 type ForArrayExpr struct {
 	// Iterator variables
-	ValueVar string // The value variable name (e.g. "v" in "for k, v in map")
-	KeyVar   string // The key variable for maps (e.g., "k" in "for k, v in map" or "x" in "for x in xs")
+	ValueVar string // The value variable ("x" in "for x in xs", "v" in "for i, v in xs")
+	KeyVar   string // The key or index variable ("i" in "for i, v in xs"), empty when only one variable is given
 
 	// Collection being iterated
 	Collection Expression // The collection being iterated over (e.g., "xs" in "for x in xs")
 
 	// Result expressions
-	ThenValueExpr Expression // The value expression for map outputs (e.g., "v" in "for k, v in map : k => v")
+	ThenValueExpr Expression // The element expression ("upper(x)" in "[for x in xs : upper(x)]")
 
 	// Filtering and grouping
 	Condition Expression // Optional "if" condition (e.g., "x != null" in "for x in xs : x if x != null")
@@ -201,8 +203,8 @@ func (f *ForArrayExpr) Range() hcl.Range {
 
 // SplatExpr represents splat expressions: aws_instance.server[*].id
 type SplatExpr struct {
-	Source    Expression // Expression being splattered
-	Each      Expression // Expression to evaluate for each element
+	Source    Expression // Expression being splattered ("aws_instance.server")
+	Each      Expression // Expression to evaluate for each element, in which a SplatItemExpr stands for the element (".id")
 	ExprRange hcl.Range
 }
 
@@ -214,11 +216,27 @@ func (s *SplatExpr) Range() hcl.Range {
 	return s.ExprRange
 }
 
+// SplatItemExpr stands for the current element inside SplatExpr.Each: in
+// x[*].id, Each is a RelativeTraversalExpr whose Source is a SplatItemExpr,
+// and in x[*], Each is the SplatItemExpr itself.
+type SplatItemExpr struct {
+	ExprRange hcl.Range
+}
+
+func (s *SplatItemExpr) ExpressionType() string {
+	return "splat_item"
+}
+
+func (s *SplatItemExpr) Range() hcl.Range {
+	return s.ExprRange
+}
+
 // HeredocExpr represents heredoc strings
 type HeredocExpr struct {
-	Marker    string // The heredoc marker (e.g., "EOT")
-	Content   string // The content of the heredoc
-	Indented  bool   // Whether it's an indented heredoc (<<-)
+	Marker    string       // The heredoc marker (e.g., "EOT")
+	Content   string       // The lines between the marker lines as written, without the last newline; for <<- the indentation they share is removed
+	Indented  bool         // Whether it's an indented heredoc (<<-)
+	Parts     []Expression // The parsed template, as in TemplateExpr.Parts
 	ExprRange hcl.Range
 }
 
@@ -243,20 +261,6 @@ func (i *IndexExpr) ExpressionType() string {
 
 func (i *IndexExpr) Range() hcl.Range {
 	return i.ExprRange
-}
-
-// TupleExpr represents tuple expressions
-type TupleExpr struct {
-	Expressions []Expression
-	ExprRange   hcl.Range
-}
-
-func (t *TupleExpr) ExpressionType() string {
-	return "tuple"
-}
-
-func (t *TupleExpr) Range() hcl.Range {
-	return t.ExprRange
 }
 
 // ParenExpr represents parenthesized expressions
@@ -288,7 +292,10 @@ func (u *UnaryExpr) Range() hcl.Range {
 	return u.ExprRange
 }
 
-// RelativeTraversalExpr for attribute access like aws_instance.example.id
+// RelativeTraversalExpr is attribute and constant index access applied to
+// Source: local.m[var.k].id, element(xs, 0).id, or aws_instance.x[0].id
+// (Source is the ReferenceExpr aws_instance.x, then [0] and .id). A name
+// followed by attribute steps only, like var.a.b, is a ReferenceExpr.
 type RelativeTraversalExpr struct {
 	Source    Expression
 	Traversal []TraversalElem
@@ -297,8 +304,8 @@ type RelativeTraversalExpr struct {
 
 type TraversalElem struct {
 	Type  string     // "attr" or "index"
-	Name  string     // For attribute access
-	Index Expression // For index access
+	Name  string     // The attribute name, for "attr"
+	Index Expression // The key as a LiteralValue, for "index"
 }
 
 func (r *RelativeTraversalExpr) ExpressionType() string {
@@ -307,37 +314,4 @@ func (r *RelativeTraversalExpr) ExpressionType() string {
 
 func (r *RelativeTraversalExpr) Range() hcl.Range {
 	return r.ExprRange
-}
-
-// TemplateForDirective represents for loops within template strings
-type TemplateForDirective struct {
-	KeyVar    string       // Optional key variable for maps
-	ValueVar  string       // Value variable
-	CollExpr  Expression   // Collection to iterate over
-	Content   []Expression // Content to repeat for each iteration
-	ExprRange hcl.Range
-}
-
-func (t *TemplateForDirective) ExpressionType() string {
-	return "template_for"
-}
-
-func (t *TemplateForDirective) Range() hcl.Range {
-	return t.ExprRange
-}
-
-// TemplateIfDirective represents conditional logic within template strings
-type TemplateIfDirective struct {
-	Condition Expression
-	TrueExpr  []Expression
-	FalseExpr []Expression
-	ExprRange hcl.Range
-}
-
-func (t *TemplateIfDirective) ExpressionType() string {
-	return "template_if"
-}
-
-func (t *TemplateIfDirective) Range() hcl.Range {
-	return t.ExprRange
 }

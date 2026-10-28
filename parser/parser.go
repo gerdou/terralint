@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"bytes"
 	"fmt"
 	"math/big"
 	"os"
@@ -10,120 +11,55 @@ import (
 	"github.com/gerdou/terralint/parser/types"
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
-	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/zclconf/go-cty/cty"
-)
-
-// Block types
-const (
-	BlockTypeDynamic = "dynamic"
 )
 
 // ParseTerraformFile reads a Terraform file and parses it into an AST
 func ParseTerraformFile(filePath string) (*types.Root, error) {
-	// Read the file content
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read file: %w", err)
 	}
 
-	// Parse the file using HCL's native parser with comments enabled
 	file, diags := hclsyntax.ParseConfig(content, filePath, hcl.InitialPos)
 	if diags.HasErrors() {
 		return nil, fmt.Errorf("failed to parse HCL: %s", diags.Error())
 	}
 
-	// Create root node
-	root := &types.Root{
-		Children: make([]types.Body, 0),
+	// Lex once: comments are looked up by line, heredocs by start offset.
+	c := &converter{content: content, heredocs: map[int]hclsyntax.Token{}}
+	tokens, _ := hclsyntax.LexConfig(content, filePath, hcl.InitialPos)
+	for _, tok := range tokens {
+		switch tok.Type {
+		case hclsyntax.TokenComment:
+			c.comments = append(c.comments, tok)
+		case hclsyntax.TokenOHeredoc:
+			c.heredocs[tok.Range.Start.Byte] = tok
+		}
 	}
 
-	// Get the root body
+	root := &types.Root{Children: make([]types.Body, 0)}
 	body := file.Body.(*hclsyntax.Body)
 
-	// Process attributes and blocks in order by their source position
-	var items []hclsyntax.Node
-	for name, attr := range body.Attributes {
-		items = append(items, &hclsyntax.Attribute{
-			Name:        name,
-			Expr:        attr.Expr,
-			SrcRange:    attr.SrcRange,
-			NameRange:   attr.NameRange,
-			EqualsRange: attr.EqualsRange,
-		})
-	}
-	for _, block := range body.Blocks {
-		items = append(items, block)
-	}
-
-	// Sort items by their source position
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].Range().Start.Line < items[j].Range().Start.Line ||
-			(items[i].Range().Start.Line == items[j].Range().Start.Line &&
-				items[i].Range().Start.Column < items[j].Range().Start.Column)
-	})
-
-	// If there are no items but there are comments at the start of the file,
-	// create an empty block with those comments
-	if len(items) == 0 {
-		tokens, diags := hclsyntax.LexConfig(content, filePath, hcl.InitialPos)
-		if !diags.HasErrors() {
-			var comments []string
-			for _, token := range tokens {
-				if token.Type == hclsyntax.TokenComment {
-					comment := string(token.Bytes)
-					if len(comment) > 0 {
-						comments = append(comments, comment)
-					}
-				}
-			}
-			if len(comments) > 0 {
-				var strippedComments []string
-				for _, comment := range comments {
-					strippedComments = append(strippedComments, stripCommentPrefix(comment))
-				}
-				root.Children = append(root.Children, &types.Block{
-					BlockComment: strings.Join(strippedComments, "\n"),
-				})
-			}
+	// A file with only comments becomes one typeless block holding them.
+	if len(body.Attributes) == 0 && len(body.Blocks) == 0 {
+		if len(c.comments) > 0 {
+			root.Children = append(root.Children, &types.Block{BlockComment: c.leading(0, len(content)+1)})
 		}
 		return root, nil
 	}
 
-	// Process items in order
-	var lastEndLine int
-	for i, item := range items {
-		// For the first item, we want to include all comments from the start of the file
-		var startLine int
-		if i == 0 {
-			startLine = 1
-		} else {
-			startLine = lastEndLine + 1
-		}
-
-		switch item := item.(type) {
-		case *hclsyntax.Attribute:
-			attribute, err := convertAttribute(item.Name, item, content, startLine, item.Range().Start.Line)
-			if err != nil {
-				return nil, fmt.Errorf("failed to convert attribute %s: %w", item.Name, err)
-			}
-			root.Children = append(root.Children, attribute)
-			lastEndLine = item.Range().End.Line
-		case *hclsyntax.Block:
-			block, err := convertBlock(item, content, startLine, item.Range().Start.Line)
-			if err != nil {
-				return nil, fmt.Errorf("failed to convert block: %w", err)
-			}
-			root.Children = append(root.Children, block)
-			lastEndLine = item.Range().End.Line
-		}
+	root.Children, err = c.body(body, 0, len(content))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", filePath, err)
 	}
-
 	return root, nil
 }
 
-func isWhitespace(b byte) bool {
-	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+type converter struct {
+	content  []byte
+	comments []hclsyntax.Token       // in source order
+	heredocs map[int]hclsyntax.Token // heredoc openers by start byte
 }
 
 func stripCommentPrefix(comment string) string {
@@ -139,569 +75,333 @@ func stripCommentPrefix(comment string) string {
 	return strings.TrimSpace(comment)
 }
 
-func convertBlock(block *hclsyntax.Block, content []byte, startLine, endLine int) (*types.Block, error) {
-	// Extract comments for the block
-	var blockComment string
-	if startLine < endLine {
-		tokens, diags := hclsyntax.LexConfig(content, block.TypeRange.Filename, hcl.InitialPos)
-		if !diags.HasErrors() {
-			var comments []string
-			for _, token := range tokens {
-				if token.Type == hclsyntax.TokenComment {
-					if token.Range.Start.Line >= startLine && token.Range.Start.Line < endLine {
-						comment := string(token.Bytes)
-						if len(comment) > 0 {
-							comments = append(comments, comment)
-						}
-					}
-				}
-			}
-			if len(comments) > 0 {
-				var strippedComments []string
-				for _, comment := range comments {
-					strippedComments = append(strippedComments, stripCommentPrefix(comment))
-				}
-				blockComment = strings.Join(strippedComments, "\n")
-			}
+// commentsFrom returns the comments that start on line or later.
+func (c *converter) commentsFrom(line int) []hclsyntax.Token {
+	i := sort.Search(len(c.comments), func(i int) bool { return c.comments[i].Range.Start.Line >= line })
+	return c.comments[i:]
+}
+
+// leading joins the comments that start after afterLine and before beforeLine.
+func (c *converter) leading(afterLine, beforeLine int) string {
+	var comments []string
+	for _, tok := range c.commentsFrom(afterLine + 1) {
+		if tok.Range.Start.Line >= beforeLine {
+			break
+		}
+		comments = append(comments, stripCommentPrefix(string(tok.Bytes)))
+	}
+	return strings.Join(comments, "\n")
+}
+
+// inline returns the first comment on start's line that starts after start
+// and before the byte offset limit.
+func (c *converter) inline(start hcl.Pos, limit int) string {
+	for _, tok := range c.commentsFrom(start.Line) {
+		if tok.Range.Start.Line > start.Line || tok.Range.Start.Byte >= limit {
+			break
+		}
+		if tok.Range.Start.Byte > start.Byte {
+			return stripCommentPrefix(string(tok.Bytes))
 		}
 	}
+	return ""
+}
 
-	result := &types.Block{
-		Type:         block.Type,
-		Labels:       block.Labels,
-		Range:        block.Range(),
-		Children:     make([]types.Body, 0),
-		BlockComment: blockComment,
-	}
-
-	// Process inline comment
-	tokens, diags := hclsyntax.LexConfig(content, block.TypeRange.Filename, hcl.InitialPos)
-	if !diags.HasErrors() {
-		for _, token := range tokens {
-			if token.Type == hclsyntax.TokenComment &&
-				token.Range.Start.Line == block.TypeRange.Start.Line {
-				result.InlineComment = stripCommentPrefix(string(token.Bytes))
-				break
-			}
-		}
-	}
-
-	// Process attributes and blocks in order by their source position
+// body converts the attributes and blocks of a body in source order.
+// openLine is the line the body opens on (0 for a file) and endByte the
+// offset where it ends.
+func (c *converter) body(body *hclsyntax.Body, openLine, endByte int) ([]types.Body, error) {
 	var items []hclsyntax.Node
-	for name, attr := range block.Body.Attributes {
-		items = append(items, &hclsyntax.Attribute{
-			Name:        name,
-			Expr:        attr.Expr,
-			SrcRange:    attr.SrcRange,
-			NameRange:   attr.NameRange,
-			EqualsRange: attr.EqualsRange,
-		})
+	for _, attr := range body.Attributes {
+		items = append(items, attr)
 	}
-	for _, nestedBlock := range block.Body.Blocks {
-		items = append(items, nestedBlock)
+	for _, block := range body.Blocks {
+		items = append(items, block)
 	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Range().Start.Byte < items[j].Range().Start.Byte })
 
-	// Sort items by their source position
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].Range().Start.Line < items[j].Range().Start.Line ||
-			(items[i].Range().Start.Line == items[j].Range().Start.Line &&
-				items[i].Range().Start.Column < items[j].Range().Start.Column)
-	})
-
-	// Process items in order
-	var lastChildEndLine int = block.Body.Range().Start.Line
-	for _, item := range items {
-		var itemStartLine int = lastChildEndLine + 1
+	children := make([]types.Body, 0, len(items))
+	prevEndLine := openLine
+	for i, item := range items {
+		limit := endByte
+		if i+1 < len(items) {
+			limit = items[i+1].Range().Start.Byte
+		}
+		start := item.Range().Start
+		blockComment, inlineComment := c.leading(prevEndLine, start.Line), c.inline(start, limit)
 
 		switch item := item.(type) {
 		case *hclsyntax.Attribute:
-			attribute, err := convertAttribute(item.Name, item, content, itemStartLine, item.Range().Start.Line)
+			value, err := c.expr(item.Expr)
 			if err != nil {
-				return nil, fmt.Errorf("failed to convert attribute %s: %w", item.Name, err)
+				return nil, fmt.Errorf("failed to convert attribute %s (line %d): %w", item.Name, start.Line, err)
 			}
-			result.Children = append(result.Children, attribute)
-			lastChildEndLine = item.Range().End.Line
+			children = append(children, &types.Attribute{
+				Name:          item.Name,
+				Value:         value,
+				Range:         item.SrcRange,
+				InlineComment: inlineComment,
+				BlockComment:  blockComment,
+			})
 		case *hclsyntax.Block:
-			nested, err := convertBlock(item, content, itemStartLine, item.Range().Start.Line)
+			nested, err := c.body(item.Body, item.OpenBraceRange.Start.Line, item.CloseBraceRange.Start.Byte)
 			if err != nil {
-				return nil, fmt.Errorf("failed to convert nested block: %w", err)
+				return nil, fmt.Errorf("failed to convert block %s (line %d): %w", item.Type, start.Line, err)
 			}
-			result.Children = append(result.Children, nested)
-			lastChildEndLine = item.Range().End.Line
+			children = append(children, &types.Block{
+				Type:          item.Type,
+				Labels:        item.Labels,
+				Range:         item.Range(),
+				Children:      nested,
+				InlineComment: inlineComment,
+				BlockComment:  blockComment,
+			})
+		}
+		prevEndLine = item.Range().End.Line
+	}
+	return children, nil
+}
+
+var operators = map[*hclsyntax.Operation]string{
+	hclsyntax.OpAdd: "+", hclsyntax.OpSubtract: "-", hclsyntax.OpMultiply: "*",
+	hclsyntax.OpDivide: "/", hclsyntax.OpModulo: "%", hclsyntax.OpNegate: "-",
+	hclsyntax.OpLogicalAnd: "&&", hclsyntax.OpLogicalOr: "||", hclsyntax.OpLogicalNot: "!",
+	hclsyntax.OpEqual: "==", hclsyntax.OpNotEqual: "!=",
+	hclsyntax.OpGreaterThan: ">", hclsyntax.OpGreaterThanOrEqual: ">=",
+	hclsyntax.OpLessThan: "<", hclsyntax.OpLessThanOrEqual: "<=",
+}
+
+func literal(v cty.Value, rng hcl.Range) *types.LiteralValue {
+	l := &types.LiteralValue{ValueType: v.Type().FriendlyName(), ExprRange: rng}
+	switch {
+	case v.IsNull():
+		l.ValueType = "null"
+	case v.Type() == cty.String:
+		l.Value = v.AsString()
+	case v.Type() == cty.Bool:
+		l.Value = v.True()
+	case v.Type() == cty.Number:
+		bf := v.AsBigFloat()
+		if i, acc := bf.Int64(); acc == big.Exact {
+			l.Value = i
+		} else {
+			l.Value, _ = bf.Float64()
 		}
 	}
+	return l
+}
 
+func (c *converter) exprs(exprs []hclsyntax.Expression) ([]types.Expression, error) {
+	result := make([]types.Expression, len(exprs))
+	for i, expr := range exprs {
+		converted, err := c.expr(expr)
+		if err != nil {
+			return nil, err
+		}
+		result[i] = converted
+	}
 	return result, nil
 }
 
-func convertAttribute(name string, attr *hclsyntax.Attribute, content []byte, startLine int, endLine int) (*types.Attribute, error) {
-	expr, err := convertExpression(attr.Expr)
-	if err != nil {
-		return nil, err
-	}
-
-	a := &types.Attribute{
-		Name:  name,
-		Value: expr,
-		Range: attr.Range(),
-	}
-
-	// Extract comments using HCL's token functionality
-	tokens, diags := hclsyntax.LexConfig(content, attr.NameRange.Filename, hcl.InitialPos)
-	if !diags.HasErrors() {
-		// Process all comments before the attribute
-		var comments []string
-		for _, token := range tokens {
-			if token.Type == hclsyntax.TokenComment {
-				if token.Range.Start.Line >= startLine && token.Range.Start.Line < endLine {
-					comment := string(token.Bytes)
-					if len(comment) > 0 {
-						comments = append(comments, comment)
-					}
-				}
-			}
-		}
-
-		// Set the block comment if we found any
-		if len(comments) > 0 {
-			var strippedComments []string
-			for _, comment := range comments {
-				strippedComments = append(strippedComments, stripCommentPrefix(comment))
-			}
-			a.BlockComment = strings.Join(strippedComments, "\n")
+// traversal converts traversal steps after a source expression.
+func traversal(steps hcl.Traversal) ([]types.TraversalElem, error) {
+	result := make([]types.TraversalElem, len(steps))
+	for i, step := range steps {
+		switch s := step.(type) {
+		case hcl.TraverseAttr:
+			result[i] = types.TraversalElem{Type: "attr", Name: s.Name}
+		case hcl.TraverseIndex:
+			result[i] = types.TraversalElem{Type: "index", Index: literal(s.Key, s.SrcRange)}
+		default:
+			return nil, fmt.Errorf("unsupported traversal step %T", step)
 		}
 	}
-
-	// Process inline comment
-	tokens, diags = hclsyntax.LexConfig(content, attr.NameRange.Filename, hcl.InitialPos)
-	if !diags.HasErrors() {
-		for _, token := range tokens {
-			if token.Type == hclsyntax.TokenComment &&
-				token.Range.Start.Line == attr.NameRange.Start.Line {
-				a.InlineComment = stripCommentPrefix(string(token.Bytes))
-				break
-			}
-		}
-	}
-
-	return a, nil
+	return result, nil
 }
 
-func convertExpression(expr hclsyntax.Expression) (types.Expression, error) {
+// heredoc builds the HeredocExpr for a template that opens with the heredoc
+// token open.
+func (c *converter) heredoc(open hclsyntax.Token, parts []types.Expression, rng hcl.Range) *types.HeredocExpr {
+	// The closing marker is on the last line; the body ends where that line starts.
+	bodyEnd := bytes.LastIndexByte(c.content[:rng.End.Byte], '\n') + 1
+	body := strings.TrimSuffix(string(c.content[open.Range.End.Byte:bodyEnd]), "\n")
+	h := &types.HeredocExpr{
+		Marker:    strings.TrimSpace(strings.TrimLeft(string(open.Bytes), "<-")),
+		Indented:  bytes.HasPrefix(open.Bytes, []byte("<<-")),
+		Parts:     parts,
+		ExprRange: rng,
+	}
+	lines := strings.Split(body, "\n")
+	if h.Indented {
+		indent := -1
+		for _, line := range lines {
+			if n := len(line) - len(strings.TrimLeft(line, " \t")); strings.TrimSpace(line) != "" && (indent < 0 || n < indent) {
+				indent = n
+			}
+		}
+		for i, line := range lines {
+			lines[i] = line[min(max(indent, 0), len(line)-len(strings.TrimLeft(line, " \t"))):]
+		}
+	}
+	h.Content = strings.Join(lines, "\n")
+	return h
+}
+
+func (c *converter) expr(expr hclsyntax.Expression) (types.Expression, error) {
+	rng := expr.Range()
 	switch e := expr.(type) {
 	case *hclsyntax.LiteralValueExpr:
-		var value interface{}
-		switch {
-		case e.Val.Type() == cty.String:
-			value = e.Val.AsString()
-		case e.Val.Type() == cty.Bool:
-			value = e.Val.True()
-		case e.Val.Type() == cty.Number:
-			bf := e.Val.AsBigFloat()
-			if bf.IsInt() {
-				i, _ := bf.Int64()
-				value = i
-			} else {
-				f, _ := bf.Float64()
-				value = f
-			}
-		default:
-			value = e.Val.GoString()
-		}
-		return &types.LiteralValue{
-			Value:     value,
-			ValueType: e.Val.Type().FriendlyName(),
-			ExprRange: e.Range(),
-		}, nil
+		return literal(e.Val, rng), nil
 	case *hclsyntax.TemplateExpr:
-		// Check if this is a single literal value
-		if len(e.Parts) == 1 {
-			if lit, ok := e.Parts[0].(*hclsyntax.LiteralValueExpr); ok {
-				var value interface{}
-				switch {
-				case lit.Val.Type() == cty.String:
-					value = lit.Val.AsString()
-				case lit.Val.Type() == cty.Bool:
-					value = lit.Val.True()
-				case lit.Val.Type() == cty.Number:
-					bf := lit.Val.AsBigFloat()
-					if bf.IsInt() {
-						i, _ := bf.Int64()
-						value = i
-					} else {
-						f, _ := bf.Float64()
-						value = f
-					}
-				default:
-					value = lit.Val.GoString()
-				}
-				return &types.LiteralValue{
-					Value:     value,
-					ValueType: lit.Val.Type().FriendlyName(),
-					ExprRange: e.Range(),
-				}, nil
+		parts, err := c.exprs(e.Parts)
+		if err != nil {
+			return nil, err
+		}
+		if open, ok := c.heredocs[rng.Start.Byte]; ok {
+			return c.heredoc(open, parts, rng), nil
+		}
+		if len(parts) == 1 {
+			if lit, ok := parts[0].(*types.LiteralValue); ok {
+				lit.ExprRange = rng
+				return lit, nil
 			}
 		}
-
-		// Check if this is a heredoc by looking at the source code
-		srcRange := e.Range()
-		if srcRange.Start.Line != srcRange.End.Line && len(e.Parts) > 0 {
-			// This is a multi-line template, treat it as a heredoc
-			if lit, ok := e.Parts[0].(*hclsyntax.LiteralValueExpr); ok {
-				return &types.HeredocExpr{
-					Marker:    "EOT", // Default marker
-					Content:   lit.Val.AsString(),
-					Indented:  false,
-					ExprRange: e.Range(),
-				}, nil
-			}
+		return &types.TemplateExpr{Parts: parts, ExprRange: rng}, nil
+	case *hclsyntax.TemplateWrapExpr:
+		return c.expr(e.Wrapped)
+	case *hclsyntax.TemplateJoinExpr:
+		tuple, err := c.expr(e.Tuple)
+		if err != nil {
+			return nil, err
 		}
-
-		parts := make([]types.Expression, len(e.Parts))
-		for i, part := range e.Parts {
-			converted, err := convertExpression(part)
-			if err != nil {
-				return nil, err
-			}
-			parts[i] = converted
-		}
-		return &types.TemplateExpr{
-			Parts:     parts,
-			ExprRange: e.Range(),
-		}, nil
+		return &types.TemplateExpr{Parts: []types.Expression{tuple}, ExprRange: rng}, nil
 	case *hclsyntax.ScopeTraversalExpr:
-		// Check if this is a single part that's a quoted string
-		if len(e.Traversal) == 1 {
-			if root, ok := e.Traversal[0].(hcl.TraverseRoot); ok {
-				if strings.HasPrefix(root.Name, "\"") && strings.HasSuffix(root.Name, "\"") {
-					// This is a quoted string, treat it as a literal
-					value := strings.Trim(root.Name, "\"")
-					return &types.LiteralValue{
-						Value:     value,
-						ValueType: "string",
-						ExprRange: e.Range(),
-					}, nil
-				}
-			}
-		}
-
-		// Build parts for traversal
-		parts := make([]string, len(e.Traversal))
-		for i, traverser := range e.Traversal {
-			switch t := traverser.(type) {
-			case hcl.TraverseRoot:
-				parts[i] = t.Name
-			case hcl.TraverseAttr:
-				parts[i] = t.Name
-			case hcl.TraverseIndex:
-				switch t.Key.Type() {
-				case cty.Number:
-					bf := t.Key.AsBigFloat()
-					if intVal, acc := bf.Int64(); acc == big.Exact {
-						parts[i] = fmt.Sprintf("[%d]", intVal)
-					} else {
-						parts[i] = fmt.Sprintf("[%s]", bf.String())
-					}
-				case cty.String:
-					parts[i] = fmt.Sprintf("[%q]", t.Key.AsString())
-				}
-			}
-		}
-
-		// If any part is an index expression, return a relative traversal
-		hasIndex := false
-		for _, part := range parts {
-			if strings.HasPrefix(part, "[") {
-				hasIndex = true
+		// The name and the attribute steps after it form a reference; any
+		// later step makes a relative traversal from that reference.
+		n := 1
+		for n < len(e.Traversal) {
+			if _, ok := e.Traversal[n].(hcl.TraverseAttr); !ok {
 				break
 			}
+			n++
 		}
-
-		if hasIndex {
-			// Split parts into source and traversal
-			source := &types.ReferenceExpr{
-				Parts:     parts[:1],
-				ExprRange: e.Range(),
+		parts := make([]string, n)
+		for i, step := range e.Traversal[:n] {
+			switch s := step.(type) {
+			case hcl.TraverseRoot:
+				parts[i] = s.Name
+			case hcl.TraverseAttr:
+				parts[i] = s.Name
 			}
-			traversal := make([]types.TraversalElem, len(parts)-1)
-			for i, part := range parts[1:] {
-				if strings.HasPrefix(part, "[") {
-					traversal[i] = types.TraversalElem{
-						Type: "index",
-						Name: part,
-					}
-				} else {
-					traversal[i] = types.TraversalElem{
-						Type: "attr",
-						Name: part,
-					}
-				}
-			}
-			return &types.RelativeTraversalExpr{
-				Source:    source,
-				Traversal: traversal,
-				ExprRange: e.Range(),
-			}, nil
 		}
-
-		// Otherwise, return a reference
-		return &types.ReferenceExpr{
-			Parts:     parts,
-			ExprRange: e.Range(),
-		}, nil
+		ref := &types.ReferenceExpr{Parts: parts, ExprRange: hcl.RangeBetween(e.Traversal[0].SourceRange(), e.Traversal[n-1].SourceRange())}
+		if n == len(e.Traversal) {
+			return ref, nil
+		}
+		steps, err := traversal(e.Traversal[n:])
+		if err != nil {
+			return nil, err
+		}
+		return &types.RelativeTraversalExpr{Source: ref, Traversal: steps, ExprRange: rng}, nil
+	case *hclsyntax.RelativeTraversalExpr:
+		source, err := c.expr(e.Source)
+		if err != nil {
+			return nil, err
+		}
+		steps, err := traversal(e.Traversal)
+		if err != nil {
+			return nil, err
+		}
+		return &types.RelativeTraversalExpr{Source: source, Traversal: steps, ExprRange: rng}, nil
 	case *hclsyntax.FunctionCallExpr:
-		args := make([]types.Expression, len(e.Args))
-		for i, arg := range e.Args {
-			converted, err := convertExpression(arg)
-			if err != nil {
-				return nil, err
-			}
-			args[i] = converted
+		args, err := c.exprs(e.Args)
+		if err != nil {
+			return nil, err
 		}
-
-		// Create a function call expression
-		return &types.FunctionCallExpr{
-			Name:      e.Name,
-			Args:      args,
-			ExprRange: e.Range(),
-		}, nil
+		return &types.FunctionCallExpr{Name: e.Name, Args: args, ExpandFinal: e.ExpandFinal, ExprRange: rng}, nil
 	case *hclsyntax.ObjectConsExpr:
 		items := make([]types.ObjectItem, len(e.Items))
-
-		// Get the file content for lexing
-		content, err := os.ReadFile(e.SrcRange.Filename)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read file for comment parsing: %w", err)
-		}
-
-		// Get all tokens once
-		tokens, diags := hclsyntax.LexConfig(content, e.SrcRange.Filename, hcl.InitialPos)
-		if diags.HasErrors() {
-			return nil, fmt.Errorf("failed to lex file: %s", diags.Error())
-		}
-
+		prevEndLine := rng.Start.Line
 		for i, item := range e.Items {
-			key, err := convertExpression(item.KeyExpr)
+			key, err := c.expr(item.KeyExpr)
 			if err != nil {
 				return nil, err
 			}
-			value, err := convertExpression(item.ValueExpr)
+			value, err := c.expr(item.ValueExpr)
 			if err != nil {
 				return nil, err
 			}
-
-			// Extract comments for the object item
-			var blockComment string
-			var comments []string
-			var startLine int
-			if i == 0 {
-				startLine = e.SrcRange.Start.Line
-			} else {
-				prevItem := e.Items[i-1]
-				startLine = prevItem.ValueExpr.Range().End.Line
+			limit := rng.End.Byte
+			if i+1 < len(e.Items) {
+				limit = e.Items[i+1].KeyExpr.Range().Start.Byte
 			}
-
-			for _, token := range tokens {
-				if token.Type == hclsyntax.TokenComment {
-					if token.Range.Start.Line > startLine &&
-						token.Range.Start.Line < item.KeyExpr.Range().Start.Line {
-						comment := string(token.Bytes)
-						if len(comment) > 0 {
-							comments = append(comments, comment)
-						}
-					}
-				}
-			}
-			if len(comments) > 0 {
-				var strippedComments []string
-				for _, comment := range comments {
-					strippedComments = append(strippedComments, stripCommentPrefix(comment))
-				}
-				blockComment = strings.Join(strippedComments, "\n")
-			}
-
+			start := item.KeyExpr.Range().Start
 			items[i] = types.ObjectItem{
-				Key:          key,
-				Value:        value,
-				BlockComment: blockComment,
+				Key:           key,
+				Value:         value,
+				InlineComment: c.inline(start, limit),
+				BlockComment:  c.leading(prevEndLine, start.Line),
+				ExprRange:     hcl.RangeBetween(item.KeyExpr.Range(), item.ValueExpr.Range()),
 			}
+			prevEndLine = item.ValueExpr.Range().End.Line
 		}
-		return &types.ObjectExpr{
-			Items: items,
-		}, nil
+		return &types.ObjectExpr{Items: items, ExprRange: rng}, nil
 	case *hclsyntax.ObjectConsKeyExpr:
-		// For object keys, always create a ReferenceExpr
-		if traversal, ok := e.Wrapped.(*hclsyntax.ScopeTraversalExpr); ok {
-			parts := make([]string, len(traversal.Traversal))
-			for i, traverser := range traversal.Traversal {
-				switch t := traverser.(type) {
-				case hcl.TraverseRoot:
-					parts[i] = t.Name
-				case hcl.TraverseAttr:
-					parts[i] = t.Name
-				}
-			}
-			return &types.ReferenceExpr{
-				Parts: parts,
-			}, nil
-		}
-		return convertExpression(e.Wrapped)
+		return c.expr(e.Wrapped)
 	case *hclsyntax.TupleConsExpr:
-		items := make([]types.Expression, len(e.Exprs))
-		for i, expr := range e.Exprs {
-			converted, err := convertExpression(expr)
-			if err != nil {
-				return nil, err
-			}
-			items[i] = converted
+		items, err := c.exprs(e.Exprs)
+		if err != nil {
+			return nil, err
 		}
-		return &types.ArrayExpr{
-			Items: items,
-		}, nil
+		return &types.ArrayExpr{Items: items, ExprRange: rng}, nil
 	case *hclsyntax.BinaryOpExpr:
-		left, err := convertExpression(e.LHS)
+		left, err := c.expr(e.LHS)
 		if err != nil {
 			return nil, err
 		}
-		right, err := convertExpression(e.RHS)
+		right, err := c.expr(e.RHS)
 		if err != nil {
 			return nil, err
 		}
-		// Map the operation to a string based on its token type
-		var operator string
-		switch e.Op.Type {
-		case cty.Number:
-			switch e.Op {
-			case hclsyntax.OpAdd:
-				operator = "+"
-			case hclsyntax.OpSubtract:
-				operator = "-"
-			case hclsyntax.OpMultiply:
-				operator = "*"
-			case hclsyntax.OpDivide:
-				operator = "/"
-			case hclsyntax.OpModulo:
-				operator = "%"
-			default:
-				return nil, fmt.Errorf("unsupported numeric operator")
-			}
-		case cty.Bool:
-			switch e.Op {
-			case hclsyntax.OpEqual:
-				operator = "=="
-			case hclsyntax.OpNotEqual:
-				operator = "!="
-			case hclsyntax.OpGreaterThan:
-				operator = ">"
-			case hclsyntax.OpGreaterThanOrEqual:
-				operator = ">="
-			case hclsyntax.OpLessThan:
-				operator = "<"
-			case hclsyntax.OpLessThanOrEqual:
-				operator = "<="
-			case hclsyntax.OpLogicalAnd:
-				operator = "&&"
-			case hclsyntax.OpLogicalOr:
-				operator = "||"
-			default:
-				return nil, fmt.Errorf("unsupported boolean operator")
-			}
-		case cty.DynamicPseudoType:
-			// For dynamic types, we need to determine the operator based on the operation itself
-			switch e.Op {
-			case hclsyntax.OpEqual:
-				operator = "=="
-			case hclsyntax.OpNotEqual:
-				operator = "!="
-			case hclsyntax.OpGreaterThan:
-				operator = ">"
-			case hclsyntax.OpGreaterThanOrEqual:
-				operator = ">="
-			case hclsyntax.OpLessThan:
-				operator = "<"
-			case hclsyntax.OpLessThanOrEqual:
-				operator = "<="
-			case hclsyntax.OpLogicalAnd:
-				operator = "&&"
-			case hclsyntax.OpLogicalOr:
-				operator = "||"
-			case hclsyntax.OpAdd:
-				operator = "+"
-			case hclsyntax.OpSubtract:
-				operator = "-"
-			case hclsyntax.OpMultiply:
-				operator = "*"
-			case hclsyntax.OpDivide:
-				operator = "/"
-			case hclsyntax.OpModulo:
-				operator = "%"
-			default:
-				return nil, fmt.Errorf("unsupported dynamic operator")
-			}
-		default:
-			return nil, fmt.Errorf("unsupported operator type: %s", e.Op.Type.FriendlyName())
+		operator, ok := operators[e.Op]
+		if !ok {
+			return nil, fmt.Errorf("unsupported binary operator at %s", rng)
 		}
-		return &types.BinaryExpr{
-			Left:     left,
-			Operator: operator,
-			Right:    right,
-		}, nil
+		return &types.BinaryExpr{Left: left, Operator: operator, Right: right, ExprRange: rng}, nil
 	case *hclsyntax.UnaryOpExpr:
-		expr, err := convertExpression(e.Val)
+		value, err := c.expr(e.Val)
 		if err != nil {
 			return nil, err
 		}
-		// Map the operation to a string based on its type
-		var operator string
-		switch e.Op.Impl.Params()[0].Type {
-		case cty.Number:
-			operator = "-"
-		case cty.Bool:
-			operator = "!"
-		default:
-			return nil, fmt.Errorf("unsupported unary operator type: %s", e.Op.Impl.Params()[0].Type.FriendlyName())
+		operator, ok := operators[e.Op]
+		if !ok {
+			return nil, fmt.Errorf("unsupported unary operator at %s", rng)
 		}
-		return &types.UnaryExpr{
-			Operator: operator,
-			Expr:     expr,
-		}, nil
+		return &types.UnaryExpr{Operator: operator, Expr: value, ExprRange: rng}, nil
 	case *hclsyntax.ConditionalExpr:
-		condition, err := convertExpression(e.Condition)
+		results, err := c.exprs([]hclsyntax.Expression{e.Condition, e.TrueResult, e.FalseResult})
 		if err != nil {
 			return nil, err
 		}
-		trueResult, err := convertExpression(e.TrueResult)
-		if err != nil {
-			return nil, err
-		}
-		falseResult, err := convertExpression(e.FalseResult)
-		if err != nil {
-			return nil, err
-		}
-		return &types.ConditionalExpr{
-			Condition: condition,
-			TrueExpr:  trueResult,
-			FalseExpr: falseResult,
-			ExprRange: e.Range(),
-		}, nil
+		return &types.ConditionalExpr{Condition: results[0], TrueExpr: results[1], FalseExpr: results[2], ExprRange: rng}, nil
 	case *hclsyntax.ForExpr:
-		collection, err := convertExpression(e.CollExpr)
+		collection, err := c.expr(e.CollExpr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to convert collection: %w", err)
 		}
-		thenValue, err := convertExpression(e.ValExpr)
+		thenValue, err := c.expr(e.ValExpr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to convert value expression: %w", err)
 		}
 		var condition types.Expression
 		if e.CondExpr != nil {
-			condition, err = convertExpression(e.CondExpr)
+			condition, err = c.expr(e.CondExpr)
 			if err != nil {
 				return nil, fmt.Errorf("failed to convert condition: %w", err)
 			}
 		}
 		if e.KeyExpr != nil {
-			thenKey, err := convertExpression(e.KeyExpr)
+			thenKey, err := c.expr(e.KeyExpr)
 			if err != nil {
 				return nil, fmt.Errorf("failed to convert key expression: %w", err)
 			}
@@ -712,6 +412,8 @@ func convertExpression(expr hclsyntax.Expression) (types.Expression, error) {
 				ThenKeyExpr:   thenKey,
 				ThenValueExpr: thenValue,
 				Condition:     condition,
+				Group:         e.Group,
+				ExprRange:     rng,
 			}, nil
 		}
 		return &types.ForArrayExpr{
@@ -720,240 +422,37 @@ func convertExpression(expr hclsyntax.Expression) (types.Expression, error) {
 			Collection:    collection,
 			ThenValueExpr: thenValue,
 			Condition:     condition,
+			ExprRange:     rng,
 		}, nil
 	case *hclsyntax.SplatExpr:
-		source, err := convertExpression(e.Source)
+		source, err := c.expr(e.Source)
 		if err != nil {
 			return nil, fmt.Errorf("failed to convert splat source: %w", err)
 		}
-		each, err := convertExpression(e.Each)
+		each, err := c.expr(e.Each)
 		if err != nil {
 			return nil, fmt.Errorf("failed to convert splat each: %w", err)
 		}
-		return &types.SplatExpr{
-			Source: source,
-			Each:   each,
-		}, nil
+		return &types.SplatExpr{Source: source, Each: each, ExprRange: rng}, nil
+	case *hclsyntax.AnonSymbolExpr:
+		return &types.SplatItemExpr{ExprRange: rng}, nil
 	case *hclsyntax.IndexExpr:
-		collection, err := convertExpression(e.Collection)
+		collection, err := c.expr(e.Collection)
 		if err != nil {
 			return nil, err
 		}
-		key, err := convertExpression(e.Key)
+		key, err := c.expr(e.Key)
 		if err != nil {
 			return nil, err
 		}
-		return &types.IndexExpr{
-			Collection: collection,
-			Key:        key,
-			ExprRange:  e.Range(),
-		}, nil
+		return &types.IndexExpr{Collection: collection, Key: key, ExprRange: rng}, nil
 	case *hclsyntax.ParenthesesExpr:
-		expression, err := convertExpression(e.Expression)
+		expression, err := c.expr(e.Expression)
 		if err != nil {
 			return nil, err
 		}
-		return &types.ParenExpr{
-			Expression: expression,
-			ExprRange:  e.Range(),
-		}, nil
-	case *hclsyntax.TemplateJoinExpr:
-		tuple, err := convertExpression(e.Tuple)
-		if err != nil {
-			return nil, err
-		}
-		return &types.TemplateExpr{
-			Parts:     []types.Expression{tuple},
-			ExprRange: e.Range(),
-		}, nil
-	case *hclsyntax.TemplateWrapExpr:
-		wrapped, err := convertExpression(e.Wrapped)
-		if err != nil {
-			return nil, fmt.Errorf("failed to convert wrapped expression: %w", err)
-		}
-		return wrapped, nil
+		return &types.ParenExpr{Expression: expression, ExprRange: rng}, nil
 	default:
-		return nil, fmt.Errorf("unsupported expression type: %T", expr)
+		return nil, fmt.Errorf("unsupported expression type %T at %s", expr, rng)
 	}
-}
-
-func convertExpressions(exprs []hclsyntax.Expression) ([]types.Expression, error) {
-	result := make([]types.Expression, len(exprs))
-	for i, expr := range exprs {
-		converted, err := convertExpression(expr)
-		if err != nil {
-			return nil, err
-		}
-		result[i] = converted
-	}
-	return result, nil
-}
-
-func convertLiteralValue(val cty.Value, rng hcl.Range) (*types.LiteralValue, error) {
-	var value interface{}
-	var valueType string
-
-	switch {
-	case val.Type() == cty.String:
-		value = val.AsString()
-		valueType = "string"
-	case val.Type() == cty.Number:
-		bf := val.AsBigFloat()
-		if f64, acc := bf.Float64(); acc == 0 {
-			value = f64
-			valueType = "number"
-		} else {
-			value = bf.String()
-			valueType = "number"
-		}
-	case val.Type() == cty.Bool:
-		value = val.True()
-		valueType = "bool"
-	case val.IsNull():
-		value = nil
-		valueType = "null"
-	default:
-		return nil, fmt.Errorf("unsupported literal value type: %s", val.Type().GoString())
-	}
-
-	return &types.LiteralValue{
-		Value:     value,
-		ValueType: valueType,
-		ExprRange: rng,
-	}, nil
-}
-
-func convertRange(r hcl.Range) sitter.Range {
-	return sitter.Range{
-		StartPoint: sitter.Point{
-			Row:    uint32(r.Start.Line - 1),
-			Column: uint32(r.Start.Column - 1),
-		},
-		EndPoint: sitter.Point{
-			Row:    uint32(r.End.Line - 1),
-			Column: uint32(r.End.Column - 1),
-		},
-	}
-}
-
-// getOperationSymbol returns the string representation of an operation
-func getOperationSymbol(op *hclsyntax.Operation) string {
-	switch op {
-	// Arithmetic
-	case hclsyntax.OpAdd:
-		return "+"
-	case hclsyntax.OpSubtract:
-		return "-"
-	case hclsyntax.OpMultiply:
-		return "*"
-	case hclsyntax.OpDivide:
-		return "/"
-	case hclsyntax.OpModulo:
-		return "%"
-	case hclsyntax.OpNegate:
-		return "-"
-
-	// Logical
-	case hclsyntax.OpLogicalAnd:
-		return "&&"
-	case hclsyntax.OpLogicalOr:
-		return "||"
-	case hclsyntax.OpLogicalNot:
-		return "!"
-
-	// Comparison
-	case hclsyntax.OpEqual:
-		return "=="
-	case hclsyntax.OpNotEqual:
-		return "!="
-	case hclsyntax.OpGreaterThan:
-		return ">"
-	case hclsyntax.OpGreaterThanOrEqual:
-		return ">="
-	case hclsyntax.OpLessThan:
-		return "<"
-	case hclsyntax.OpLessThanOrEqual:
-		return "<="
-
-	default:
-		return "unknown"
-	}
-}
-
-func convertTraversal(traversal []hcl.Traverser) []string {
-	parts := make([]string, len(traversal))
-	for i, traverser := range traversal {
-		switch t := traverser.(type) {
-		case hcl.TraverseRoot:
-			parts[i] = t.Name
-		case hcl.TraverseAttr:
-			parts[i] = t.Name
-		case hcl.TraverseIndex:
-			// Convert the index value to a string
-			switch {
-			case t.Key.Type() == cty.Number:
-				bf := t.Key.AsBigFloat()
-				if bf.IsInt() {
-					intVal, _ := bf.Int64()
-					parts[i] = fmt.Sprintf("[%d]", intVal)
-				} else {
-					f, _ := bf.Float64()
-					parts[i] = fmt.Sprintf("[%f]", f)
-				}
-			case t.Key.Type() == cty.String:
-				parts[i] = fmt.Sprintf("[%q]", t.Key.AsString())
-			default:
-				parts[i] = fmt.Sprintf("[%s]", t.Key.GoString())
-			}
-		}
-	}
-	return parts
-}
-
-func convertTraversalParts(traversal hcl.Traversal) []string {
-	parts := make([]string, len(traversal))
-	for i, traverser := range traversal {
-		switch t := traverser.(type) {
-		case hcl.TraverseRoot:
-			parts[i] = t.Name
-		case hcl.TraverseAttr:
-			parts[i] = t.Name
-		case hcl.TraverseIndex:
-			// Convert the index value to a string
-			switch {
-			case t.Key.Type() == cty.Number:
-				bf := t.Key.AsBigFloat()
-				if bf.IsInt() {
-					intVal, _ := bf.Int64()
-					parts[i] = fmt.Sprintf("[%d]", intVal)
-				} else {
-					f, _ := bf.Float64()
-					parts[i] = fmt.Sprintf("[%f]", f)
-				}
-			case t.Key.Type() == cty.String:
-				parts[i] = fmt.Sprintf("[%q]", t.Key.AsString())
-			default:
-				parts[i] = fmt.Sprintf("[%s]", t.Key.GoString())
-			}
-		}
-	}
-	return parts
-}
-
-// isReferenceExpr checks if a traversal should be treated as a reference expression
-func isReferenceExpr(parts []string) bool {
-	if len(parts) == 0 {
-		return false
-	}
-
-	// If it's a single part, it's a reference if it's a simple identifier
-	if len(parts) == 1 {
-		// Check if it's a simple identifier (not an index)
-		return !strings.HasPrefix(parts[0], "[")
-	}
-
-	// If it's a traversal with multiple parts, it's a reference if:
-	// 1. The first part is a simple identifier (not an index)
-	// 2. The subsequent parts are either simple identifiers or indices
-	return !strings.HasPrefix(parts[0], "[")
 }
