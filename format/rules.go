@@ -116,7 +116,7 @@ func (f *formatter) renamePlan(pl *plan, keep bool) {
 			// call are named after variables, and keep the names those keep.
 			tfvars := f.tfvars && pl.top
 			arg := pl.blockType == "module" && pl.depth == 1
-			if tfvars && f.dashed(n.Name) && f.decl().whole["var."+n.Name] {
+			if tfvars && f.decl().whole["var."+n.Name] {
 				on = false
 			}
 			name, keys := on, on
@@ -139,7 +139,7 @@ func (f *formatter) renamePlan(pl *plan, keep bool) {
 			}
 			f.renameRefs(n.Value)
 		case *types.Block:
-			if pl.top && n.Type == "variable" && len(n.Labels) > 0 && f.dashed(n.Labels[0]) && f.decl().whole["var."+n.Labels[0]] {
+			if pl.top && n.Type == "variable" && len(n.Labels) > 0 && f.decl().whole["var."+n.Labels[0]] {
 				on = false
 			}
 			if pl.top {

@@ -1778,6 +1778,17 @@ module "m" {
 		t.Errorf("terraform.tfvars:\ngot:\n%s\nwant:\n%s", got, w)
 	}
 
+	// The pairing holds for undashed variable names too (R10b-001, D25).
+	plain := map[string]string{
+		"variables.tf":     "variable \"db\" {\n  type = object({\n    instance-class = string\n  })\n}\n\n# terralint ignore_naming\nvariable \"tags\" {\n  default = {\n    cost-center = \"1\"\n  }\n}\n",
+		"terraform.tfvars": "# terralint ignore_naming\ndb = {\n  instance-class = \"db.t3.micro\"\n}\n\ntags = {\n  cost-center = \"1234\"\n}\n",
+	}
+	for name, want := range plain {
+		if got := formatSource(t, config.Default(), name, plain); got != want {
+			t.Errorf("undashed variable names, %s:\ngot:\n%s\nwant:\n%s", name, got, want)
+		}
+	}
+
 	// With the rule off nothing is renamed; with a type left out of Labels,
 	// its labels, the names after it and the references to it keep theirs.
 	off := config.Default()

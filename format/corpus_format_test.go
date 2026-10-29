@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -413,6 +414,19 @@ type dirDecls struct {
 
 func (r *dirDecls) has(key string) bool { return strings.Contains(key, "-") && r.names[key] }
 
+// withCheck returns r plus the data sources a check block's body declares:
+// they are scoped to the check, and references to them there follow their
+// rename (D24).
+func (r *dirDecls) withCheck(body *hclsyntax.Body) *dirDecls {
+	names := maps.Clone(r.names)
+	for _, b := range body.Blocks {
+		if b.Type == "data" && len(b.Labels) > 1 {
+			names["data."+b.Labels[0]+"."+b.Labels[1]] = true
+		}
+	}
+	return &dirDecls{names: names, outs: r.outs}
+}
+
 var declCache sync.Map
 
 func declsFor(dir string) *dirDecls {
@@ -622,7 +636,11 @@ func (d *dumper) dumpBodyOf(b *hclsyntax.Body, top bool, blockType string) (stri
 		if top {
 			typ = nb.Type
 		}
-		inner, err := d.dumpBodyOf(nb.Body, false, typ)
+		in := d
+		if top && nb.Type == "check" && d.refs != nil {
+			in = &dumper{refs: d.refs.withCheck(nb.Body)}
+		}
+		inner, err := in.dumpBodyOf(nb.Body, false, typ)
 		if err != nil {
 			return "", err
 		}
@@ -1225,6 +1243,26 @@ func (c *ruleChecker) list(l *hclsyntax.TupleConsExpr) {
 		if l.Exprs[i].Range().Start.Line == l.Exprs[i-1].Range().End.Line {
 			c.fail(l.Exprs[i].Range(), "multi-line list with two elements on one line")
 		}
+	}
+}
+
+// TestGateCheckScopedData pins the gate's model of D24: a data source in a
+// check block is a declaration for references in that check (R10c-001).
+func TestGateCheckScopedData(t *testing.T) {
+	src := "check \"c\" {\n  data \"http\" \"my-site\" {}\n\n  assert {\n    condition     = data.http.my-site.id != \"\"\n    error_message = \"down\"\n  }\n}\n"
+	path := filepath.Join(t.TempDir(), "main.tf")
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := format.File(path, config.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ps := checkOutput(path, []byte(src), out); len(ps) > 0 {
+		t.Errorf("the gate rejects the formatter's output:\n%s\n%q", out, ps)
+	}
+	if ps := checkOutput(path, []byte(src), bytes.Replace(out, []byte("data.http.my_site"), []byte("data.http.my-site"), 1)); len(ps) == 0 {
+		t.Errorf("the gate accepts a reference left dashed after its scoped data source was renamed")
 	}
 }
 
