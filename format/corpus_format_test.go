@@ -316,11 +316,12 @@ func checkOutput(path string, src, out []byte) []string {
 	}
 	srcFile, _ := hclsyntax.ParseConfig(src, path, hcl.InitialPos)
 
-	// Meaning.
-	want, err := dumpBody(srcFile.Body.(*hclsyntax.Body), true)
+	// Meaning. In the source, references to names the directory declares
+	// follow their rename; the output's references are compared as written.
+	want, err := (&dumper{refs: declsFor(filepath.Dir(path))}).dumpBody(srcFile.Body.(*hclsyntax.Body), true)
 	if err != nil {
 		fail("dumping source: %v", err)
-	} else if got, err := dumpBody(outFile.Body.(*hclsyntax.Body), true); err != nil {
+	} else if got, err := (&dumper{}).dumpBody(outFile.Body.(*hclsyntax.Body), true); err != nil {
 		fail("dumping output: %v", err)
 	} else if got != want {
 		fail("output means something else: %s", firstSemDiff(want, got))
@@ -349,14 +350,6 @@ func checkOutput(path string, src, out []byte) []string {
 		got := commentLines(leadingComments(outToks))
 		if len(got) < len(header) || strings.Join(got[:len(header)], "\n") != strings.Join(header, "\n") {
 			fail("file header comment %q is no longer at the top", header)
-		}
-	}
-
-	// Naming: no unquoted identifier keeps a '-', except provider local names (D12).
-	keep := providerRanges(outFile.Body.(*hclsyntax.Body))
-	for i, tok := range outToks {
-		if tok.Type == hclsyntax.TokenIdent && bytes.ContainsRune(tok.Bytes, '-') && !keep(tok, outToks, i) {
-			fail("line %d: identifier %q still has a '-'", tok.Range.Start.Line, tok.Bytes)
 		}
 	}
 
@@ -395,47 +388,160 @@ func doubleBlank(toks hclsyntax.Tokens) (int, bool) {
 	return 0, false
 }
 
-// providerRanges reports whether a token names a provider local name, which
-// keeps its '-' (D12): inside a required_providers block, in the value of a
-// provider or providers attribute, or a provider-function namespace (next to ::).
-func providerRanges(b *hclsyntax.Body) func(tok hclsyntax.Token, toks hclsyntax.Tokens, i int) bool {
-	var ranges []hcl.Range
-	var walk func(b *hclsyntax.Body)
-	walk = func(b *hclsyntax.Body) {
-		for name, a := range b.Attributes {
-			if name == "provider" || name == "providers" {
-				ranges = append(ranges, a.SrcRange)
-			}
-		}
-		for _, blk := range b.Blocks {
-			if blk.Type == "required_providers" {
-				ranges = append(ranges, blk.Range())
-			}
-			walk(blk.Body)
-		}
-	}
-	walk(b)
-	return func(tok hclsyntax.Token, toks hclsyntax.Tokens, i int) bool {
-		if (i > 0 && toks[i-1].Type == hclsyntax.TokenDoubleColon) || (i+1 < len(toks) && toks[i+1].Type == hclsyntax.TokenDoubleColon) {
-			return true
-		}
-		for _, r := range ranges {
-			if tok.Range.Start.Byte >= r.Start.Byte && tok.Range.End.Byte <= r.End.Byte {
-				return true
-			}
-		}
-		return false
-	}
-}
-
 // ---- Meaning: a canonical dump with the intended changes applied. ----
 
 func ren(s string) string { return strings.ReplaceAll(s, "-", "_") }
 
 // Labels that name things, by block type: the label index that is renamed.
 // Provider block labels are not here: provider local names are never renamed
-// (D12), because Terraform rejects "_" in them.
-var namedLabel = map[string]int{"variable": 0, "output": 0, "module": 0, "dynamic": 0, "resource": 1, "data": 1, "ephemeral": 1}
+// (D12), because Terraform rejects "_" in them. A dynamic block's label is a
+// block type of the provider's schema, not a name.
+var namedLabel = map[string]int{"variable": 0, "output": 0, "module": 0, "resource": 1, "data": 1, "ephemeral": 1}
+
+// dumper renders expressions canonically. With refs, the name part of a
+// reference to a dashed name the directory declares is renamed, as the
+// naming rule renames it; without, references are rendered as written.
+type dumper struct{ refs *dirDecls }
+
+// dirDecls are the dashed names a directory's .tf files declare, by the
+// start of the references to them, and the dashed outputs of its local child
+// modules, by module call label.
+type dirDecls struct {
+	names map[string]bool
+	outs  map[string]map[string]bool
+}
+
+func (r *dirDecls) has(key string) bool { return strings.Contains(key, "-") && r.names[key] }
+
+var declCache sync.Map
+
+func declsFor(dir string) *dirDecls {
+	if v, ok := declCache.Load(dir); ok {
+		return v.(*dirDecls)
+	}
+	r := &dirDecls{names: map[string]bool{}, outs: map[string]map[string]bool{}}
+	eachBody(dir, func(b *hclsyntax.Body) {
+		for _, blk := range b.Blocks {
+			l := blk.Labels
+			switch {
+			case blk.Type == "variable" && len(l) > 0:
+				r.names["var."+l[0]] = true
+			case blk.Type == "locals":
+				for name := range blk.Body.Attributes {
+					r.names["local."+name] = true
+				}
+			case blk.Type == "module" && len(l) > 0:
+				r.names["module."+l[0]] = true
+				if src, ok := blk.Body.Attributes["source"]; ok {
+					if v, diags := src.Expr.Value(nil); !diags.HasErrors() && v.Type() == cty.String {
+						if s := v.AsString(); strings.HasPrefix(s, "./") || strings.HasPrefix(s, "../") {
+							outs := map[string]bool{}
+							eachBody(filepath.Join(dir, s), func(cb *hclsyntax.Body) {
+								for _, o := range cb.Blocks {
+									if o.Type == "output" && len(o.Labels) > 0 {
+										outs[o.Labels[0]] = true
+									}
+								}
+							})
+							r.outs[l[0]] = outs
+						}
+					}
+				}
+			case blk.Type == "resource" && len(l) > 1:
+				r.names[l[0]+"."+l[1]] = true
+			case (blk.Type == "data" || blk.Type == "ephemeral") && len(l) > 1:
+				r.names[blk.Type+"."+l[0]+"."+l[1]] = true
+			}
+		}
+	})
+	declCache.Store(dir, r)
+	return r
+}
+
+// eachBody calls fn with the body of every .tf file in dir that parses,
+// following links to files, as Terraform loads a module's files.
+func eachBody(dir string, fn func(*hclsyntax.Body)) {
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) != ".tf" || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		if info, err := os.Stat(filepath.Join(dir, e.Name())); err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		src, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		if f, diags := hclsyntax.ParseConfig(src, e.Name(), hcl.InitialPos); !diags.HasErrors() {
+			fn(f.Body.(*hclsyntax.Body))
+		}
+	}
+}
+
+// absNames returns the steps of an absolute traversal that the naming rule
+// renames: the name part of a reference to a declared name, and the output
+// read from a local child module.
+func (d *dumper) absNames(tr hcl.Traversal) map[int]bool {
+	out := map[int]bool{}
+	if d.refs == nil {
+		return out
+	}
+	attr := func(i int) string {
+		if i < len(tr) {
+			if a, ok := tr[i].(hcl.TraverseAttr); ok {
+				return a.Name
+			}
+		}
+		return ""
+	}
+	switch root := tr.RootName(); root {
+	case "data", "ephemeral":
+		out[2] = d.refs.has(root + "." + attr(1) + "." + attr(2))
+	case "module":
+		out[1] = d.refs.has("module." + attr(1))
+		for i := 2; i < len(tr); i++ {
+			if a, ok := tr[i].(hcl.TraverseAttr); ok {
+				out[i] = strings.Contains(a.Name, "-") && d.refs.outs[attr(1)][a.Name]
+				break
+			}
+		}
+	default:
+		out[1] = d.refs.has(root + "." + attr(1))
+	}
+	return out
+}
+
+// relNames returns the steps of a relative traversal that the rule renames:
+// the output, when it reads module call m's local child module.
+func (d *dumper) relNames(m string, tr hcl.Traversal) map[int]bool {
+	out := map[int]bool{}
+	if d.refs == nil || m == "" {
+		return out
+	}
+	for i, step := range tr {
+		if a, ok := step.(hcl.TraverseAttr); ok {
+			out[i] = strings.Contains(a.Name, "-") && d.refs.outs[m][a.Name]
+			break
+		}
+	}
+	return out
+}
+
+// moduleOf returns <name> when e is module.<name>, indexed or not.
+func moduleOf(e hclsyntax.Expression) string {
+	switch x := e.(type) {
+	case *hclsyntax.IndexExpr:
+		return moduleOf(x.Collection)
+	case *hclsyntax.ScopeTraversalExpr:
+		if len(x.Traversal) == 2 && x.Traversal.RootName() == "module" {
+			if a, ok := x.Traversal[1].(hcl.TraverseAttr); ok {
+				return a.Name
+			}
+		}
+	}
+	return ""
+}
 
 func blockLabels(b *hclsyntax.Block) []string {
 	labels := append([]string{}, b.Labels...)
@@ -448,13 +554,13 @@ func blockLabels(b *hclsyntax.Block) []string {
 // effectiveType is the type a nested block contributes: dynamic "x" is an x.
 func effectiveType(b *hclsyntax.Block) string {
 	if b.Type == "dynamic" && len(b.Labels) > 0 {
-		return ren(b.Labels[0])
+		return b.Labels[0]
 	}
 	return ren(b.Type)
 }
 
-func dumpBody(b *hclsyntax.Body, top bool) (string, error) {
-	return dumpBodyOf(b, top, "")
+func (d *dumper) dumpBody(b *hclsyntax.Body, top bool) (string, error) {
+	return d.dumpBodyOf(b, top, "")
 }
 
 // legacyType gives the dump of the type expression `terraform fmt` rewrites a
@@ -485,10 +591,10 @@ func legacyType(e hclsyntax.Expression) (string, bool) {
 	return "", false
 }
 
-func dumpBodyOf(b *hclsyntax.Body, top bool, blockType string) (string, error) {
+func (d *dumper) dumpBodyOf(b *hclsyntax.Body, top bool, blockType string) (string, error) {
 	var attrs []string
 	for name, a := range b.Attributes {
-		v, err := dumpExpr(a.Expr)
+		v, err := d.dumpExpr(a.Expr)
 		if err != nil {
 			return "", err
 		}
@@ -504,7 +610,7 @@ func dumpBodyOf(b *hclsyntax.Body, top bool, blockType string) (string, error) {
 	for _, nb := range b.Blocks {
 		if top && nb.Type == "locals" {
 			for name, a := range nb.Body.Attributes {
-				v, err := dumpExpr(a.Expr)
+				v, err := d.dumpExpr(a.Expr)
 				if err != nil {
 					return "", err
 				}
@@ -516,7 +622,7 @@ func dumpBodyOf(b *hclsyntax.Body, top bool, blockType string) (string, error) {
 		if top {
 			typ = nb.Type
 		}
-		inner, err := dumpBodyOf(nb.Body, false, typ)
+		inner, err := d.dumpBodyOf(nb.Body, false, typ)
 		if err != nil {
 			return "", err
 		}
@@ -581,14 +687,18 @@ func dumpValue(v cty.Value) (string, error) {
 	return "", fmt.Errorf("unexpected literal of type %s", v.Type().FriendlyName())
 }
 
-func dumpTraversal(tr hcl.Traversal) (string, error) {
+func (d *dumper) dumpTraversal(tr hcl.Traversal, rename map[int]bool) (string, error) {
 	var b strings.Builder
-	for _, step := range tr {
+	for i, step := range tr {
 		switch s := step.(type) {
 		case hcl.TraverseRoot:
-			b.WriteString(ren(s.Name))
+			b.WriteString(s.Name)
 		case hcl.TraverseAttr:
-			b.WriteString("." + ren(s.Name))
+			if rename[i] {
+				b.WriteString("." + ren(s.Name))
+			} else {
+				b.WriteString("." + s.Name)
+			}
 		case hcl.TraverseIndex:
 			k, err := dumpValue(s.Key)
 			if err != nil {
@@ -605,9 +715,10 @@ func dumpTraversal(tr hcl.Traversal) (string, error) {
 }
 
 // dumpExpr renders an expression canonically: parentheses, "${x}" for x and
-// how template text is split into parts are ignored; '-' in identifiers is
-// renamed; object items are sorted.
-func dumpExpr(e hclsyntax.Expression) (string, error) {
+// how template text is split into parts are ignored; unquoted object keys
+// are renamed (they are left of "=") and object items sorted; references
+// follow d.refs.
+func (d *dumper) dumpExpr(e hclsyntax.Expression) (string, error) {
 	list := func(xs ...hclsyntax.Expression) (string, error) {
 		var out []string
 		for _, x := range xs {
@@ -615,7 +726,7 @@ func dumpExpr(e hclsyntax.Expression) (string, error) {
 				out = append(out, "-")
 				continue
 			}
-			s, err := dumpExpr(x)
+			s, err := d.dumpExpr(x)
 			if err != nil {
 				return "", err
 			}
@@ -625,9 +736,9 @@ func dumpExpr(e hclsyntax.Expression) (string, error) {
 	}
 	switch e := e.(type) {
 	case *hclsyntax.ParenthesesExpr:
-		return dumpExpr(e.Expression)
+		return d.dumpExpr(e.Expression)
 	case *hclsyntax.TemplateWrapExpr:
-		return dumpExpr(e.Wrapped)
+		return d.dumpExpr(e.Wrapped)
 	case *hclsyntax.LiteralValueExpr:
 		return dumpValue(e.Val)
 	case *hclsyntax.TemplateExpr:
@@ -645,7 +756,7 @@ func dumpExpr(e hclsyntax.Expression) (string, error) {
 				continue
 			}
 			flush()
-			s, err := dumpExpr(p)
+			s, err := d.dumpExpr(p)
 			if err != nil {
 				return "", err
 			}
@@ -660,17 +771,17 @@ func dumpExpr(e hclsyntax.Expression) (string, error) {
 		}
 		return "tmpl(" + strings.Join(parts, ", ") + ")", nil
 	case *hclsyntax.TemplateJoinExpr:
-		s, err := dumpExpr(e.Tuple)
+		s, err := d.dumpExpr(e.Tuple)
 		return "join(" + s + ")", err
 	case *hclsyntax.ScopeTraversalExpr:
-		s, err := dumpTraversal(e.Traversal)
+		s, err := d.dumpTraversal(e.Traversal, d.absNames(e.Traversal))
 		return "trav(" + s + ")", err
 	case *hclsyntax.RelativeTraversalExpr:
-		src, err := dumpExpr(e.Source)
+		src, err := d.dumpExpr(e.Source)
 		if err != nil {
 			return "", err
 		}
-		s, err := dumpTraversal(e.Traversal)
+		s, err := d.dumpTraversal(e.Traversal, d.relNames(moduleOf(e.Source), e.Traversal))
 		return "rel(" + src + ", " + s + ")", err
 	case *hclsyntax.FunctionCallExpr:
 		args, err := list(e.Args...)
@@ -682,7 +793,7 @@ func dumpExpr(e hclsyntax.Expression) (string, error) {
 		s, err := list(e.LHS, e.RHS)
 		return "bin(" + opSymbols[e.Op] + ", " + s + ")", err
 	case *hclsyntax.UnaryOpExpr:
-		s, err := dumpExpr(e.Val)
+		s, err := d.dumpExpr(e.Val)
 		return "un(" + opSymbols[e.Op] + ", " + s + ")", err
 	case *hclsyntax.TupleConsExpr:
 		s, err := list(e.Exprs...)
@@ -690,11 +801,11 @@ func dumpExpr(e hclsyntax.Expression) (string, error) {
 	case *hclsyntax.ObjectConsExpr:
 		var items []string
 		for _, item := range e.Items {
-			k, err := dumpKey(item.KeyExpr)
+			k, err := d.dumpKey(item.KeyExpr)
 			if err != nil {
 				return "", err
 			}
-			v, err := dumpExpr(item.ValueExpr)
+			v, err := d.dumpExpr(item.ValueExpr)
 			if err != nil {
 				return "", err
 			}
@@ -704,8 +815,18 @@ func dumpExpr(e hclsyntax.Expression) (string, error) {
 		return "obj(" + strings.Join(items, ", ") + ")", nil
 	case *hclsyntax.ForExpr:
 		s, err := list(e.CollExpr, e.KeyExpr, e.ValExpr, e.CondExpr)
-		return fmt.Sprintf("for(k=%s, v=%s, %s, group=%v)", ren(e.KeyVar), ren(e.ValVar), s, e.Group), err
+		return fmt.Sprintf("for(k=%s, v=%s, %s, group=%v)", e.KeyVar, e.ValVar, s, e.Group), err
 	case *hclsyntax.SplatExpr:
+		if rel, ok := e.Each.(*hclsyntax.RelativeTraversalExpr); ok {
+			if m := moduleOf(e.Source); m != "" { // module.<name>[*].<output>
+				src, err := d.dumpExpr(e.Source)
+				if err != nil {
+					return "", err
+				}
+				each, err := d.dumpTraversal(rel.Traversal, d.relNames(m, rel.Traversal))
+				return "splat(" + src + ", rel(@, " + each + "))", err
+			}
+		}
 		s, err := list(e.Source, e.Each)
 		return "splat(" + s + ")", err
 	case *hclsyntax.AnonSymbolExpr:
@@ -719,10 +840,10 @@ func dumpExpr(e hclsyntax.Expression) (string, error) {
 
 // dumpKey renders an object key: an unquoted key is a renamed literal name,
 // a quoted key keeps its text.
-func dumpKey(e hclsyntax.Expression) (string, error) {
+func (d *dumper) dumpKey(e hclsyntax.Expression) (string, error) {
 	k, ok := e.(*hclsyntax.ObjectConsKeyExpr)
 	if !ok {
-		return dumpExpr(e)
+		return d.dumpExpr(e)
 	}
 	if !k.ForceNonLiteral {
 		if _, isTrav := k.Wrapped.(*hclsyntax.ScopeTraversalExpr); isTrav {
@@ -734,7 +855,7 @@ func dumpKey(e hclsyntax.Expression) (string, error) {
 			return fmt.Sprintf("s:%q", name), nil
 		}
 	}
-	s, err := dumpExpr(k.Wrapped)
+	s, err := d.dumpExpr(k.Wrapped)
 	return "key(" + s + ")", err
 }
 
@@ -952,6 +1073,15 @@ func (c *ruleChecker) body(b *hclsyntax.Body, blockType string, top bool) {
 	for _, item := range items {
 		switch n := item.(type) {
 		case *hclsyntax.Attribute:
+			// Names left of "=" follow the naming rule, but provider local
+			// names (D12): required_providers entries and a module's providers.
+			provider := blockType == "required_providers" || blockType == "module" && n.Name == "providers"
+			if strings.Contains(n.Name, "-") && !provider {
+				c.fail(n.SrcRange, "attribute name %q still has a '-'", n.Name)
+			}
+			if !provider {
+				c.keys(n.Expr)
+			}
 			c.expr(n.Expr)
 		case *hclsyntax.Block:
 			if i, ok := namedLabel[n.Type]; ok && i < len(n.Labels) && strings.Contains(n.Labels[i], "-") {
@@ -1026,6 +1156,20 @@ func (c *ruleChecker) expr(e hclsyntax.Expression) {
 			c.object(x)
 		case *hclsyntax.TupleConsExpr:
 			c.list(x)
+		}
+		return nil
+	})
+}
+
+// keys reports unquoted object keys in e that keep a '-'.
+func (c *ruleChecker) keys(e hclsyntax.Expression) {
+	hclsyntax.VisitAll(e, func(n hclsyntax.Node) hcl.Diagnostics {
+		if k, ok := n.(*hclsyntax.ObjectConsKeyExpr); ok && !k.ForceNonLiteral {
+			if _, trav := k.Wrapped.(*hclsyntax.ScopeTraversalExpr); trav {
+				if name := hcl.ExprAsKeyword(k.Wrapped); strings.Contains(name, "-") {
+					c.fail(k.Range(), "object key %q still has a '-'", name)
+				}
+			}
 		}
 		return nil
 	})

@@ -25,6 +25,9 @@ func formatSource(t *testing.T, cfg *config.Config, name string, files map[strin
 	t.Helper()
 	dir := t.TempDir()
 	for n, content := range files {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, n)), 0o755); err != nil {
+			t.Fatal(err)
+		}
 		if err := os.WriteFile(filepath.Join(dir, n), []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -245,97 +248,6 @@ locals {
 `)
 }
 
-func TestNamingExemptions(t *testing.T) {
-	files := map[string]string{
-		"main.tf": `output "o-1" {
-  value = [var.my-var, var.other-var, local.my-local, module.my-mod.out-x, aws_s3_bucket.my-b.id]
-}
-`,
-		"vars.tf": `# terralint ignore_naming
-variable "my-var" {}
-
-variable "other-var" {}
-
-locals {
-  # terralint ignore_naming
-  my-local = 1
-}
-
-# terralint ignore_naming {
-module "my-mod" {
-  source = "./m"
-}
-
-resource "aws_s3_bucket" "my-b" {}
-# }
-`,
-	}
-	got := formatSource(t, config.Default(), "main.tf", files)
-	want := `output "o_1" {
-  value = [
-    var.my-var,
-    var.other_var,
-    local.my-local,
-    module.my-mod.out_x,
-    aws_s3_bucket.my-b.id,
-  ]
-}
-`
-	if got != want {
-		t.Errorf("main.tf:\ngot:\n%s\nwant:\n%s", got, want)
-	}
-	got = formatSource(t, config.Default(), "vars.tf", files)
-	if !strings.Contains(got, `variable "my-var" {}`) || !strings.Contains(got, `variable "other_var" {}`) ||
-		!strings.Contains(got, "my-local = 1") || !strings.Contains(got, `module "my-mod"`) {
-		t.Errorf("vars.tf: exempt declarations renamed or others kept:\n%s", got)
-	}
-}
-
-func TestNaming(t *testing.T) {
-	check(t, nil, `provider "google-beta" {}
-
-resource "aws_x" "my-y" {
-  provider = google-beta
-  for_each = { for my-k, my-v in var.my-m : my-k => my-v... }
-  name     = "${var.a-b}-c-d"
-  key      = local.m["my-key"]
-  quoted = {
-    "Cost-Center" = 1
-    my-key        = 2
-  }
-  dynamic "my-block" {
-    for_each = var.x
-    content {
-      a = my-block.value
-    }
-  }
-}
-`, `provider "google-beta" {}
-
-resource "aws_x" "my_y" {
-  for_each = { for my_k, my_v in var.my_m : my_k => my_v... }
-
-  provider = google-beta
-
-  key  = local.m["my-key"]
-  name = "${var.a_b}-c-d"
-
-  quoted = {
-    "Cost-Center" = 1
-    my_key        = 2
-  }
-
-  dynamic "my_block" {
-    for_each = var.x
-
-    content {
-      a = my_block.value
-    }
-  }
-}
-`)
-}
-
 func TestCommentPlacement(t *testing.T) {
 	check(t, nil, `// header line one
 /* header
@@ -540,7 +452,7 @@ variable "v" {
   a = "x\u0041 $${not} %%{not} ${var.b~} y %{if c~} z %{~else} w %{endif}"
 
   b = <<-EOT
-    hello ${var.my_name}
+    hello ${var.my-name}
       %{~for k, v in var.m~}
       ${k}
       %{endfor}
@@ -757,106 +669,6 @@ func TestRound1Templates(t *testing.T) {
 `)
 }
 
-func TestRound1Naming(t *testing.T) {
-	// In an exempt item, references to names declared elsewhere are renamed;
-	// its own names, for-expression variables and kept dynamic iterators are
-	// not (R1b-001).
-	check(t, nil, `variable "bucket-name" {}
-
-locals {
-  common-tags = { team = "x" }
-}
-
-# terralint ignore_naming
-resource "aws_s3_bucket" "my-bucket" {
-  bucket = var.bucket-name
-  tags   = { my-key = local.common-tags }
-  names  = [for my-x in var.bucket-name : my-x]
-  dynamic "my-rule" {
-    for_each = var.bucket-name
-    iterator = my-it
-    content {
-      id = my-it.value
-    }
-  }
-}
-`, `locals {
-  common_tags = {
-    team = "x"
-  }
-}
-
-# terralint ignore_naming
-resource "aws_s3_bucket" "my-bucket" {
-  bucket = var.bucket_name
-  names  = [for my-x in var.bucket_name : my-x]
-
-  dynamic "my-rule" {
-    for_each = var.bucket_name
-    iterator = my-it
-
-    content {
-      id = my-it.value
-    }
-  }
-
-  tags = {
-    my-key = local.common_tags
-  }
-}
-
-variable "bucket_name" {}
-`)
-
-	// ephemeral labels are names, like data's (R1b-008).
-	check(t, nil, `ephemeral "random_password" "db-pass" {}
-
-output "o" {
-  value = ephemeral.random_password.db-pass.result
-}
-`, `ephemeral "random_password" "db_pass" {}
-
-output "o" {
-  value = ephemeral.random_password.db_pass.result
-}
-`)
-
-	// Exemptions reach references through dynamic indexes (R1b-005) and
-	// variable assignments in .tfvars files (R1b-004).
-	files := map[string]string{
-		"vars.tf": `# terralint ignore_naming
-variable "instance-type" {}
-
-# terralint ignore_naming
-locals {
-  my-map = {
-    a = {
-      sub-key = "x"
-    }
-  }
-}
-`,
-		"main.tf": `output "o" {
-  value = [local.my-map[var.k].sub-key, local.my-map[*].sub-key]
-}
-`,
-		"terraform.tfvars": `instance-type = "t3.micro"
-other-type    = "t3.small"
-`,
-	}
-	if got, want := formatSource(t, config.Default(), "main.tf", files), `output "o" {
-  value = [local.my-map[var.k].sub-key, local.my-map[*].sub-key]
-}
-`; got != want {
-		t.Errorf("main.tf:\n%s\nwant:\n%s", got, want)
-	}
-	if got, want := formatSource(t, config.Default(), "terraform.tfvars", files), `instance-type = "t3.micro"
-other_type    = "t3.small"
-`; got != want {
-		t.Errorf("terraform.tfvars:\n%s\nwant:\n%s", got, want)
-	}
-}
-
 func TestRound1Order(t *testing.T) {
 	// Top-level blocks in a priority group sort by labels too (R1b-006).
 	check(t, nil, `provider "google" {}
@@ -947,178 +759,6 @@ resource "a" "y" {}
 resource "a" "y" {}
 # end of file
 `)
-}
-
-func TestRound2Naming(t *testing.T) {
-	// ignore_naming on a module call keeps the call's name; its arguments
-	// and the outputs read from it follow the child module, whose variables
-	// and outputs are renamed. A marker on an argument keeps that one
-	// (R2b-002).
-	check(t, nil, `# terralint ignore_naming
-module "vpc-main" {
-  source     = "./modules/vpc"
-  cidr-block = "10.0.0.0/16"
-  # terralint ignore_naming
-  dashed-arg = { my-key = 1 }
-}
-
-output "o" {
-  value = [module.vpc-main.vpc-id, module.vpc-main["a"].vpc-id, [for m in module.vpc-main : m.vpc-id]]
-}
-`, `# terralint ignore_naming
-module "vpc-main" {
-  source = "./modules/vpc"
-
-  cidr_block = "10.0.0.0/16"
-
-  # terralint ignore_naming
-  dashed-arg = {
-    my-key = 1
-  }
-}
-
-output "o" {
-  value = [
-    module.vpc-main.vpc_id,
-    module.vpc-main["a"].vpc_id,
-    [for m in module.vpc-main : m.vpc_id],
-  ]
-}
-`)
-
-	// ignore_naming on a .tfvars assignment exempts the variable it sets,
-	// in every file of the directory (R2b-004).
-	files := map[string]string{
-		"main.tf": `output "o" {
-  value = var.instance-type
-}
-
-variable "instance-type" {}
-`,
-		"terraform.tfvars": `# terralint ignore_naming
-instance-type = "t3.micro"
-`,
-	}
-	if got := formatSource(t, config.Default(), "main.tf", files); got != files["main.tf"] {
-		t.Errorf("main.tf:\n%s\nwant:\n%s", got, files["main.tf"])
-	}
-	if got := formatSource(t, config.Default(), "terraform.tfvars", files); got != files["terraform.tfvars"] {
-		t.Errorf("terraform.tfvars:\n%s\nwant:\n%s", got, files["terraform.tfvars"])
-	}
-
-	// A block type missing from Naming.Labels keeps its names, and the
-	// references to them keep theirs too (R2b-003).
-	src := `provider "google-beta" {}
-
-module "vpc-main" {
-  source     = "./x"
-  cidr-block = var.my-var
-}
-
-resource "google_x" "y" {
-  provider = google-beta
-  v        = [module.vpc-main.out-x, var.my-var.sub-key]
-}
-
-variable "my-var" {}
-`
-	for _, tt := range []struct{ drop, want string }{
-		{"provider", `provider "google-beta" {}
-
-module "vpc_main" {
-  source = "./x"
-
-  cidr_block = var.my_var
-}
-
-resource "google_x" "y" {
-  provider = google-beta
-
-  v = [module.vpc_main.out_x, var.my_var.sub_key]
-}
-
-variable "my_var" {}
-`},
-		{"module", `provider "google-beta" {}
-
-module "vpc-main" {
-  source = "./x"
-
-  cidr_block = var.my_var
-}
-
-resource "google_x" "y" {
-  provider = google-beta
-
-  v = [module.vpc-main.out_x, var.my_var.sub_key]
-}
-
-variable "my_var" {}
-`},
-		{"variable", `provider "google-beta" {}
-
-module "vpc_main" {
-  source = "./x"
-
-  cidr-block = var.my-var
-}
-
-resource "google_x" "y" {
-  provider = google-beta
-
-  v = [module.vpc_main.out_x, var.my-var.sub_key]
-}
-
-variable "my-var" {}
-`},
-		{"output", `provider "google-beta" {}
-
-module "vpc_main" {
-  source = "./x"
-
-  cidr_block = var.my_var
-}
-
-resource "google_x" "y" {
-  provider = google-beta
-
-  v = [module.vpc_main.out-x, var.my_var.sub_key]
-}
-
-variable "my_var" {}
-`},
-	} {
-		cfg := config.Default()
-		delete(cfg.Naming.Labels, tt.drop)
-		if got := formatSource(t, cfg, "main.tf", map[string]string{"main.tf": src}); got != tt.want {
-			t.Errorf("without %s labels:\n%s\nwant:\n%s", tt.drop, got, tt.want)
-		}
-	}
-	cfg := config.Default()
-	delete(cfg.Naming.Labels, "dynamic")
-	check(t, cfg, `resource "a" "b" {
-  dynamic "my-rule" {
-    for_each = var.rules
-    content {
-      id = my-rule.value
-    }
-  }
-}
-`, `resource "a" "b" {
-  dynamic "my-rule" {
-    for_each = var.rules
-
-    content {
-      id = my-rule.value
-    }
-  }
-}
-`)
-	cfg = config.Default()
-	delete(cfg.Naming.Labels, "variable")
-	if got, want := formatSource(t, cfg, "a.tfvars", map[string]string{"a.tfvars": "my-var = { my-key = 1 }\n"}), "my-var = {\n  my_key = 1\n}\n"; got != want {
-		t.Errorf("without variable labels, a.tfvars:\n%s\nwant:\n%s", got, want)
-	}
 }
 
 func TestRound2Layout(t *testing.T) {
@@ -1380,168 +1020,6 @@ func TestRound3Comments(t *testing.T) {
 `)
 }
 
-func TestRound3Naming(t *testing.T) {
-	// Provider local names keep their dashes everywhere they appear, because
-	// Terraform rejects "_" in them (D12; R3b-001, R3b-002).
-	src := `terraform {
-  required_providers {
-    google-beta = {
-      source                = "hashicorp/google-beta"
-      configuration_aliases = [google-beta.us-east]
-    }
-  }
-}
-
-provider "google-beta" {
-  alias      = "us-east"
-  my-setting = var.my-var
-}
-
-module "my-mod" {
-  source = "./m"
-  providers = {
-    google-beta = google-beta.us-east
-  }
-}
-
-resource "google_x" "my-y" {
-  provider = google-beta.us-east
-  name     = provider::google-beta::f(var.my-var)
-}
-
-import {
-  provider = google-beta
-  to       = google_x.my-y
-  id       = "x"
-}
-`
-	check(t, nil, src, `terraform {
-  required_providers {
-    google-beta = {
-      configuration_aliases = [google-beta.us-east]
-      source                = "hashicorp/google-beta"
-    }
-  }
-}
-
-provider "google-beta" {
-  alias      = "us-east"
-  my_setting = var.my_var
-}
-
-import {
-  id       = "x"
-  provider = google-beta
-  to       = google_x.my_y
-}
-
-module "my_mod" {
-  source = "./m"
-
-  providers = {
-    google-beta = google-beta.us-east
-  }
-}
-
-resource "google_x" "my_y" {
-  provider = google-beta.us-east
-
-  name = provider::google-beta::f(var.my_var)
-}
-`)
-	// With "provider" in Naming.Labels, they are renamed in all those places.
-	cfg := config.Default()
-	cfg.Naming.Labels["provider"] = 0
-	got := formatSource(t, cfg, "main.tf", map[string]string{"main.tf": src})
-	for _, want := range []string{"google_beta = {", "[google_beta.us_east]", `provider "google_beta"`, "google_beta = google_beta.us_east", "provider = google_beta.us_east", "provider = google_beta\n"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("with provider labels, no %q in:\n%s", want, got)
-		}
-	}
-
-	// ignore_naming on a .tfvars assignment keeps the names in the variable's
-	// declaration too, so its type still matches the value and the
-	// references (R3b-004).
-	files := map[string]string{
-		"main.tf": `variable "db-config" {
-  type = object({
-    instance-class = string
-  })
-  default = {
-    instance-class = "db.t3.micro"
-  }
-}
-
-output "o" {
-  value = var.db-config.instance-class
-}
-`,
-		"terraform.tfvars": `# terralint ignore_naming
-db-config = {
-  instance-class = "db.t3.small"
-}
-`,
-	}
-	want := `output "o" {
-  value = var.db-config.instance-class
-}
-
-variable "db-config" {
-  type = object({
-    instance-class = string
-  })
-
-  default = {
-    instance-class = "db.t3.micro"
-  }
-}
-`
-	if got := formatSource(t, config.Default(), "main.tf", files); got != want {
-		t.Errorf("main.tf:\n%s\nwant:\n%s", got, want)
-	}
-
-	// Without "output" in Naming.Labels, a read of a module call's output
-	// keeps the output's name, and the keys after it are renamed, as in the
-	// child's output value (R3b-005).
-	cfg = config.Default()
-	delete(cfg.Naming.Labels, "output")
-	check(t, cfg, `output "o-1" {
-  value = [
-    module.net.vpc-id,
-    module.net["a"].vpc-id,
-    module.net[each.key].subnet-ids.private-a,
-    module.net["a"].subnet-ids.private-a,
-    module.net.subnet-ids.private-a,
-    module.net[*].subnet-ids.private-a,
-    module.net["a"].subnet-ids[0].private-a,
-  ]
-}
-
-output "subnet-ids" {
-  value = {
-    private-a = "x"
-  }
-}
-`, `output "o-1" {
-  value = [
-    module.net.vpc-id,
-    module.net["a"].vpc-id,
-    module.net[each.key].subnet-ids.private_a,
-    module.net["a"].subnet-ids.private_a,
-    module.net.subnet-ids.private_a,
-    module.net[*].subnet-ids.private_a,
-    module.net["a"].subnet-ids[0].private_a,
-  ]
-}
-
-output "subnet-ids" {
-  value = {
-    private_a = "x"
-  }
-}
-`)
-}
-
 func TestRound4Comments(t *testing.T) {
 	// A comment keeps its owner when the output is parsed again (D13), so
 	// formatting twice changes nothing (check). An item's own comment ends
@@ -1705,171 +1183,6 @@ sites = {
 	}
 }
 
-func TestRound4Naming(t *testing.T) {
-	// A name read through each.value, a dynamic block's iterator or a
-	// for-expression variable keeps its dashes exactly when an ignore_naming
-	// marker in the directory keeps a key of that name (D14): here the
-	// marked variable's keys (R4b-001).
-	check(t, nil, `# terralint ignore_naming
-variable "ingress-rules" {
-  type = list(object({
-    from-port = number
-  }))
-}
-
-resource "aws_security_group" "api" {
-  dynamic "ingress" {
-    for_each = var.ingress-rules
-    content {
-      from_port = ingress.value.from-port
-    }
-  }
-}
-
-resource "terraform_data" "each" {
-  for_each = { for i, r in var.ingress-rules : i => r }
-  input    = each.value.from-port
-}
-
-output "ports" {
-  value = [for r in var.ingress-rules : r.from-port]
-}
-`, `output "ports" {
-  value = [for r in var.ingress-rules : r.from-port]
-}
-
-resource "aws_security_group" "api" {
-  dynamic "ingress" {
-    for_each = var.ingress-rules
-
-    content {
-      from_port = ingress.value.from-port
-    }
-  }
-}
-
-resource "terraform_data" "each" {
-  for_each = { for i, r in var.ingress-rules : i => r }
-
-  input = each.value.from-port
-}
-
-# terralint ignore_naming
-variable "ingress-rules" {
-  type = list(object({
-    from-port = number
-  }))
-}
-`)
-	// A marked locals entry and a marked .tfvars assignment keep their keys
-	// for such reads too.
-	files := map[string]string{
-		"main.tf": `locals {
-  # terralint ignore_naming
-  subnet-map = { us-east-1a = { cidr-block = "10.0.1.0/24" } }
-}
-
-resource "aws_subnet" "s" {
-  for_each   = local.subnet-map
-  cidr_block = each.value.cidr-block
-  name       = each.value.zone-name
-}
-
-output "ports" {
-  value = [for r in var.rules : r.to-port]
-}
-`,
-		"terraform.tfvars": `# terralint ignore_naming
-rules = [{ to-port = 443 }]
-`,
-	}
-	want := `locals {
-  # terralint ignore_naming
-  subnet-map = {
-    us-east-1a = {
-      cidr-block = "10.0.1.0/24"
-    }
-  }
-}
-
-output "ports" {
-  value = [for r in var.rules : r.to-port]
-}
-
-resource "aws_subnet" "s" {
-  for_each = local.subnet-map
-
-  cidr_block = each.value.cidr-block
-  name       = each.value.zone_name
-}
-`
-	if got := formatSource(t, config.Default(), "main.tf", files); got != want {
-		t.Errorf("main.tf:\n%s\nwant:\n%s", got, want)
-	}
-
-	// Inside an item under ignore_naming, such reads of a renamed
-	// variable's keys are renamed too, as they are when "dynamic" is left
-	// out of Naming.Labels (R4b-002).
-	src := `variable "sg-rules" {
-  type = list(object({
-    from-port = number
-  }))
-}
-
-# terralint ignore_naming
-resource "aws_security_group" "web-sg" {
-  description = join(",", [for my-r in var.sg-rules : my-r.from-port])
-
-  dynamic "my-ingress" {
-    for_each = var.sg-rules
-
-    content {
-      from_port = my-ingress.value.from-port
-    }
-  }
-}
-`
-	check(t, nil, src, `# terralint ignore_naming
-resource "aws_security_group" "web-sg" {
-  description = join(",", [for my-r in var.sg_rules : my-r.from_port])
-
-  dynamic "my-ingress" {
-    for_each = var.sg_rules
-
-    content {
-      from_port = my-ingress.value.from_port
-    }
-  }
-}
-
-variable "sg_rules" {
-  type = list(object({
-    from_port = number
-  }))
-}
-`)
-	cfg := config.Default()
-	delete(cfg.Naming.Labels, "dynamic")
-	check(t, cfg, strings.Replace(src, "# terralint ignore_naming\n", "", 1), `resource "aws_security_group" "web_sg" {
-  description = join(",", [for my_r in var.sg_rules : my_r.from_port])
-
-  dynamic "my-ingress" {
-    for_each = var.sg_rules
-
-    content {
-      from_port = my-ingress.value.from_port
-    }
-  }
-}
-
-variable "sg_rules" {
-  type = list(object({
-    from_port = number
-  }))
-}
-`)
-}
-
 func TestRound4Sections(t *testing.T) {
 	// Nested blocks of one type keep their source order across a section
 	// that holds some of them, whatever its anchor sorts to (D15, R4b-003):
@@ -2002,84 +1315,6 @@ func TestRound5Sections(t *testing.T) {
 `)
 }
 
-func TestRound5Naming(t *testing.T) {
-	// A marker on a .tfvars assignment keeps the keys of the variable's
-	// declaration, so reads of them through each.value or a for-expression
-	// variable (in the declaration's own validation too) keep them (D14,
-	// R5b-002).
-	decl := `variable "node-pools" {
-  type = map(object({
-    machine-type = string
-    min-count    = optional(number, 1)
-  }))
-
-  validation {
-    condition     = alltrue([for p in var.node-pools : p.min-count > 0])
-    error_message = "min-count must be positive."
-  }
-}
-
-resource "google_container_node_pool" "pool" {
-  for_each = var.node-pools
-
-  min_node_count = each.value.min-count
-}
-`
-	want := `resource "google_container_node_pool" "pool" {
-  for_each = var.node-pools
-
-  min_node_count = each.value.min-count
-}
-
-variable "node-pools" {
-  type = map(object({
-    machine-type = string
-    min-count    = optional(number, 1)
-  }))
-
-  validation {
-    condition     = alltrue([for p in var.node-pools : p.min-count > 0])
-    error_message = "min-count must be positive."
-  }
-}
-`
-	files := map[string]string{"main.tf": decl, "terraform.tfvars": "# terralint ignore_naming\nnode-pools = { default = { machine-type = \"e2\" } }\n"}
-	if got := formatSource(t, config.Default(), "main.tf", files); got != want {
-		t.Errorf("main.tf:\n%s\nwant:\n%s", got, want)
-	}
-
-	// A marker on the declaration keeps the keys of the variable's .tfvars
-	// assignments, which do not mention the marker.
-	files = map[string]string{
-		"main.tf": `# terralint ignore_naming
-variable "buckets" {
-  type = map(any)
-}
-
-resource "aws_s3_bucket" "b" {
-  for_each = var.buckets
-
-  force_destroy = each.value.force-destroy
-}
-`,
-		"terraform.tfvars": "buckets = { logs = { force-destroy = true } }\n",
-	}
-	want = `resource "aws_s3_bucket" "b" {
-  for_each = var.buckets
-
-  force_destroy = each.value.force-destroy
-}
-
-# terralint ignore_naming
-variable "buckets" {
-  type = map(any)
-}
-`
-	if got := formatSource(t, config.Default(), "main.tf", files); got != want {
-		t.Errorf("main.tf:\n%s\nwant:\n%s", got, want)
-	}
-}
-
 func TestRound6Comments(t *testing.T) {
 	// A comment after the opening bracket of a list or call that is an
 	// argument or element is that list's or call's own (D13): it stays at
@@ -2151,202 +1386,6 @@ func TestRound6Comments(t *testing.T) {
   ]
 }
 `)
-}
-
-func TestRound6Naming(t *testing.T) {
-	// A local whose value is a plain reference path is an alias: reads
-	// through it keep or rename their steps as reads of what it aliases
-	// would, whatever marker the local carries; the local's own name
-	// follows its own marker (D16, R6b-001).
-	files := map[string]string{
-		"main.tf": `# terralint ignore_naming
-variable "node-pools" {
-  type = map(object({
-    machine-type = string
-    min-count    = number
-  }))
-}
-
-variable "app-settings" {
-  type = object({
-    log-level = string
-  })
-}
-
-locals {
-  default-pool = var.node-pools["default"]
-}
-
-# terralint ignore_naming {
-locals {
-  app-cfg = var.app-settings
-}
-# }
-
-resource "google_container_node_pool" "default" {
-  node_count   = local.default-pool.min-count
-  machine_type = local.default-pool["machine-type"]
-  level        = local.app-cfg.log-level
-}
-`,
-	}
-	want := `locals {
-  default_pool = var.node-pools["default"]
-}
-
-# terralint ignore_naming {
-locals {
-  app-cfg = var.app_settings
-}
-# }
-
-resource "google_container_node_pool" "default" {
-  level        = local.app-cfg.log_level
-  machine_type = local.default_pool["machine-type"]
-  node_count   = local.default_pool.min-count
-}
-
-variable "app_settings" {
-  type = object({
-    log_level = string
-  })
-}
-
-# terralint ignore_naming
-variable "node-pools" {
-  type = map(object({
-    machine-type = string
-    min-count    = number
-  }))
-}
-`
-	if got := formatSource(t, config.Default(), "main.tf", files); got != want {
-		t.Errorf("main.tf:\n%s\nwant:\n%s", got, want)
-	}
-
-	// Aliases chain, and are found in files without a marker, before or
-	// after apply -d has renamed them (locals.tf is already formatted here).
-	// A local built from a call is not traced: its steps are renamed.
-	files = map[string]string{
-		"vars.tf": "# terralint ignore_naming\nvariable \"node-pools\" {\n  type = map(any)\n}\n",
-		"locals.tf": `locals {
-  default_pool = local.pools["default"]
-  merged       = merge(var.node-pools, {})
-  pools        = var.node-pools
-}
-`,
-		"main.tf": `resource "google_container_node_pool" "default" {
-  node_count = local.default-pool.min-count
-  untraced   = local.merged["default"].min-count
-}
-`,
-	}
-	want = `resource "google_container_node_pool" "default" {
-  node_count = local.default_pool.min-count
-  untraced   = local.merged["default"].min_count
-}
-`
-	if got := formatSource(t, config.Default(), "main.tf", files); got != want {
-		t.Errorf("main.tf:\n%s\nwant:\n%s", got, want)
-	}
-}
-
-func TestRound7Naming(t *testing.T) {
-	// A reference is renamed exactly when the declaration it names is
-	// (D18): with the naming rule off in config nothing is renamed, the
-	// references to dashed declarations in other files, and reads through
-	// iterators, included (R7b-001).
-	cfg := config.Default()
-	cfg.Rules[config.RuleNaming] = false
-	files := map[string]string{
-		"main.tf": `variable "my-x" {
-  type = object({
-    log-level = string
-  })
-}
-
-locals {
-  my-local = var.my-x.log-level
-  keys     = [for my-v in var.my-list : my-v.my-key]
-}
-
-resource "aws_s3_bucket" "my-bucket" {
-  for_each = var.my-map
-  bucket   = local.my-local
-  name     = each.value.my-key
-  tags = {
-    my-tag = var.my-x.log-level
-  }
-  dynamic "my-rule" {
-    for_each = var.my-list
-    content {
-      port = my-rule.value.from-port
-    }
-  }
-}
-
-module "gcp-network" {
-  source = "./net"
-}
-`,
-		"outputs.tf": `output "bucket-id" {
-  value = aws_s3_bucket.my-bucket["a"].id
-}
-
-output "network" {
-  value = module.gcp-network.network-self-link
-}
-`,
-	}
-	want := map[string]string{
-		"main.tf": `locals {
-  keys     = [for my-v in var.my-list : my-v.my-key]
-  my-local = var.my-x.log-level
-}
-
-module "gcp-network" {
-  source = "./net"
-}
-
-resource "aws_s3_bucket" "my-bucket" {
-  for_each = var.my-map
-
-  bucket = local.my-local
-  name   = each.value.my-key
-
-  dynamic "my-rule" {
-    for_each = var.my-list
-
-    content {
-      port = my-rule.value.from-port
-    }
-  }
-
-  tags = {
-    my-tag = var.my-x.log-level
-  }
-}
-
-variable "my-x" {
-  type = object({
-    log-level = string
-  })
-}
-`,
-		"outputs.tf": `output "bucket-id" {
-  value = aws_s3_bucket.my-bucket["a"].id
-}
-
-output "network" {
-  value = module.gcp-network.network-self-link
-}
-`,
-	}
-	for name := range want {
-		if got := formatSource(t, cfg, name, files); got != want[name] {
-			t.Errorf("%s:\n%s\nwant:\n%s", name, got, want[name])
-		}
-	}
 }
 
 // heldAt returns the field of src's AST that holds the comment line text,
@@ -2537,5 +1576,220 @@ output "forwarding_rules" {
 				t.Errorf("%q in the %s: held at %s, want %s", label, what, h, at)
 			}
 		}
+	}
+}
+
+func TestNamingRule(t *testing.T) {
+	// Names change, values do not: everything left of a "=" and the labels
+	// that name things are renamed; in a value only the name part of a
+	// reference to a name the directory (or a local child module) declares
+	// and renames follows it.
+	files := map[string]string{
+		"main.tf": `variable "my-x" {
+  type = object({ my-key = string })
+}
+
+locals {
+  my-local = { my-key = var.my-x.my-key, "Quoted-Key" = 1 }
+  names    = [for my-v in var.list : my-v]
+  each-key = "${var.undeclared-y}"
+}
+
+resource "aws_s3_bucket" "my-b" {
+  for_each = var.buckets
+  bucket   = local.my-local.my-key
+  name     = each.value.bucket-name
+  tags     = { Cost-Center = "x" }
+}
+
+moved {
+  from = aws_s3_bucket.old-b
+  to   = aws_s3_bucket.my-b
+}
+
+output "my-out" {
+  value = aws_s3_bucket.my-b["a"].id
+}
+
+module "reg" {
+  source = "Azure/naming/azurerm"
+  my-arg = 1
+}
+
+module "net" {
+  source = "./modules/net"
+  count  = 1
+}
+
+output "seed" {
+  value = [module.reg.unique-seed, module.net[0].vpc-id, module.net[*].kept-out, data.terraform_remote_state.s.outputs.vpc-id]
+}
+`,
+		"vars.tf":          "variable \"other-x\" {}\n\noutput \"o\" {\n  value = var.other-x\n}\n",
+		"terraform.tfvars": "other-x = 1\nundeclared-z = 2\nmy-x = { my-key = \"v\" }\n",
+		"modules/net/outputs.tf": `output "vpc-id" {
+  value = 1
+}
+
+# terralint ignore_naming
+output "kept-out" {
+  value = 2
+}
+`,
+	}
+	want := map[string]string{
+		"main.tf": `locals {
+  each_key = var.undeclared-y
+
+  my_local = {
+    my_key       = var.my_x.my-key
+    "Quoted-Key" = 1
+  }
+
+  names = [for my-v in var.list : my-v]
+}
+
+module "net" {
+  source = "./modules/net"
+
+  count = 1
+}
+
+module "reg" {
+  source = "Azure/naming/azurerm"
+
+  my_arg = 1
+}
+
+moved {
+  from = aws_s3_bucket.old-b
+  to   = aws_s3_bucket.my_b
+}
+
+output "my_out" {
+  value = aws_s3_bucket.my_b["a"].id
+}
+
+output "seed" {
+  value = [
+    module.reg.unique-seed,
+    module.net[0].vpc_id,
+    module.net[*].kept-out,
+    data.terraform_remote_state.s.outputs.vpc-id,
+  ]
+}
+
+resource "aws_s3_bucket" "my_b" {
+  for_each = var.buckets
+
+  bucket = local.my_local.my-key
+  name   = each.value.bucket-name
+
+  tags = {
+    Cost_Center = "x"
+  }
+}
+
+variable "my_x" {
+  type = object({
+    my_key = string
+  })
+}
+`,
+		"vars.tf": "output \"o\" {\n  value = var.other_x\n}\n\nvariable \"other_x\" {}\n",
+		"terraform.tfvars": `my_x = {
+  my_key = "v"
+}
+
+other_x      = 1
+undeclared_z = 2
+`,
+		"modules/net/outputs.tf": `# terralint ignore_naming
+output "kept-out" {
+  value = 2
+}
+
+output "vpc_id" {
+  value = 1
+}
+`,
+	}
+	for name, w := range want {
+		if got := formatSource(t, config.Default(), name, files); got != w {
+			t.Errorf("%s:\ngot:\n%s\nwant:\n%s", name, got, w)
+		}
+	}
+}
+
+func TestNamingMarkers(t *testing.T) {
+	// A marked item keeps its own names; references in it to renamed names
+	// still follow. A marker on a variable or on a .tfvars assignment keeps
+	// every name of both. Provider local names never change.
+	files := map[string]string{
+		"main.tf": `# terralint ignore_naming
+variable "keep-x" {
+  type = object({ a-b = string })
+}
+
+variable "set-y" {
+  type = object({ c-d = string })
+}
+
+variable "my-z" {}
+
+# terralint ignore_naming
+resource "aws_s3_bucket" "keep-me" {
+  bucket = var.my-z
+  tags   = { team-name = var.keep-x.a-b }
+}
+
+output "o" {
+  value = [aws_s3_bucket.keep-me.id, var.keep-x.a-b, var.set-y.c-d]
+}
+
+terraform {
+  required_providers {
+    google-beta = { source = "hashicorp/google-beta" }
+  }
+}
+
+provider "google-beta" {}
+
+module "m" {
+  source    = "./m"
+  providers = { google-beta = google-beta }
+}
+`,
+		"terraform.tfvars": "keep-x = { a-b = \"1\" }\n\n# terralint ignore_naming\nset-y = { c-d = \"2\" }\n",
+	}
+	got := formatSource(t, config.Default(), "main.tf", files)
+	for _, w := range []string{
+		`google-beta = {`, `provider "google-beta" {}`, `google-beta = google-beta`,
+		`value = [aws_s3_bucket.keep-me.id, var.keep-x.a-b, var.set-y.c-d]`,
+		`resource "aws_s3_bucket" "keep-me" {`, `bucket = var.my_z`, `team-name = var.keep-x.a-b`,
+		`variable "keep-x" {`, `a-b = string`, `variable "my_z" {}`, `variable "set-y" {`, `c-d = string`,
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("main.tf: want %q in:\n%s", w, got)
+		}
+	}
+	if got, w := formatSource(t, config.Default(), "terraform.tfvars", files), "keep-x = {\n  a-b = \"1\"\n}\n\n# terralint ignore_naming\nset-y = {\n  c-d = \"2\"\n}\n"; got != w {
+		t.Errorf("terraform.tfvars:\ngot:\n%s\nwant:\n%s", got, w)
+	}
+
+	// With the rule off nothing is renamed; with a type left out of Labels,
+	// its labels, the names after it and the references to it keep theirs.
+	off := config.Default()
+	off.Rules[config.RuleNaming] = false
+	check(t, off, "variable \"my-x\" {}\n\noutput \"o\" {\n  value = { my-k = var.my-x }\n}\n",
+		"output \"o\" {\n  value = {\n    my-k = var.my-x\n  }\n}\n\nvariable \"my-x\" {}\n")
+	noVar := config.Default()
+	delete(noVar.Naming.Labels, "variable")
+	if got, w := formatSource(t, noVar, "main.tf", map[string]string{"main.tf": "variable \"my-x\" {}\n\nmodule \"m\" {\n  source = \"./m\"\n  my-arg = var.my-x\n}\n", "a.tfvars": "my-x = 1\n"}),
+		"module \"m\" {\n  source = \"./m\"\n\n  my-arg = var.my-x\n}\n\nvariable \"my-x\" {}\n"; got != w {
+		t.Errorf("without variable labels:\ngot:\n%s\nwant:\n%s", got, w)
+	}
+	if got := formatSource(t, noVar, "a.tfvars", map[string]string{"main.tf": "variable \"my-x\" {}\n", "a.tfvars": "my-x = 1\n"}); got != "my-x = 1\n" {
+		t.Errorf("without variable labels, a.tfvars: %q", got)
 	}
 }

@@ -163,3 +163,21 @@ func TestCLIHidden(t *testing.T) {
 		t.Errorf("check -d .terraform: exit %d, stderr %q; want 1 naming variables.tf", code, stderr)
 	}
 }
+
+func TestApplyFormatsBeforeWriting(t *testing.T) {
+	// a.tf declares the name b.tf reads: apply -d must format b.tf against
+	// a.tf as written, so the reference follows the rename.
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "a.tf"), "variable \"my-x\" {}\n")
+	write(t, filepath.Join(dir, "b.tf"), "output \"o\" {\n  value = var.my-x\n}\n")
+	if code, _, stderr := runCLI(t, "apply", "-d", dir); code != 0 {
+		t.Fatalf("apply -d: exit %d: %s", code, stderr)
+	}
+	got, _ := os.ReadFile(filepath.Join(dir, "b.tf"))
+	if want := "output \"o\" {\n  value = var.my_x\n}\n"; string(got) != want {
+		t.Errorf("b.tf = %q, want %q", got, want)
+	}
+	if code, stdout, stderr := runCLI(t, "check", "-d", dir); code != 0 {
+		t.Errorf("check -d after apply: exit %d: %s%s", code, stdout, stderr)
+	}
+}

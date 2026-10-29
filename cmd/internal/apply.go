@@ -12,15 +12,26 @@ import (
 	"github.com/gerdou/terralint/format"
 )
 
-// Apply rewrites every file under path to follow the rules.
+// Apply rewrites every file under path to follow the rules. It formats all
+// of them before writing any: references follow the names the other files
+// of a module declare, as written.
 func Apply(path string) error {
-	return forEachFile(path, func(filePath string) error {
-		formattedBytes, err := format.File(filePath, config.Default())
-		if err != nil {
-			return err
+	type result struct {
+		path string
+		out  []byte
+	}
+	var results []result
+	err := forEachFile(path, func(filePath string) error {
+		out, err := format.File(filePath, config.Default())
+		if err == nil {
+			results = append(results, result{filePath, out})
 		}
-		return os.WriteFile(filePath, formattedBytes, 0666)
+		return err
 	})
+	for _, r := range results {
+		err = errors.Join(err, os.WriteFile(r.path, r.out, 0666))
+	}
+	return err
 }
 
 func isTerraformFile(path string) bool {

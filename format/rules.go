@@ -76,76 +76,67 @@ func (f *formatter) name(s string) string {
 	return strings.ReplaceAll(s, f.cfg.Naming.Replace, f.cfg.Naming.With)
 }
 
-// rename applies the naming rule: to attribute names, block types, the
-// labels that name things, and everything in expressions that is a name
-// (see renameExpr). A reference is renamed exactly when the declaration it
-// names is (D18): items a marker turns the rule off for keep their own
-// names, but their references to names declared elsewhere are renamed, so
-// that they still match. With the rule off in config, nothing is renamed.
+// rename applies the naming rule to names: everything left of a "=" (the
+// attribute names of blocks, locals, .tfvars files and module calls, and
+// unquoted object keys), block types, and the labels that name things.
+// Values are never renamed, but for the name part of a reference to a name
+// the directory declares and the rule renames, which follows it (D18):
+// var.<name>, local.<name>, module.<name>, <type>.<name>,
+// data.<type>.<name>, ephemeral.<type>.<name>, and an output read from a
+// local child module. Items under ignore_naming keep their own names; a
+// marker on a variable or on a .tfvars assignment of it keeps every name of
+// both. With the rule off in config, nothing is renamed.
 func (f *formatter) rename(top *plan) {
 	if f.cfg.Naming.Replace == "" || !f.cfg.On(config.RuleNaming) {
 		return
 	}
-	f.renamePlan(top, nil, false)
+	f.names = newNames()
+	f.names.collect(f, top) // before any renaming: references follow the names as written
+	f.renamePlan(top, false)
 }
 
-// renamePlan renames in a body. iters holds the iterator names of the
-// dynamic blocks around it, true for those that keep their names; keep says
-// the rule is off for the whole body.
-func (f *formatter) renamePlan(pl *plan, iters map[string]bool, keep bool) {
-	providers := f.renames("provider")
+// dashed reports whether s holds what the rule replaces.
+func (f *formatter) dashed(s string) bool { return strings.Contains(s, f.cfg.Naming.Replace) }
+
+// renamePlan renames in a body; keep says the rule is off for all of it.
+func (f *formatter) renamePlan(pl *plan, keep bool) {
 	for _, e := range pl.all() {
 		on := !keep && f.on(e.off, config.RuleNaming)
-		if !providers && providerPlace(pl, e.node) {
+		if providerPlace(pl, e.node) {
 			continue // provider local names: Terraform rejects "_" in them
 		}
 		switch n := e.node.(type) {
 		case *types.Attribute:
 			// The assignments of a .tfvars file and the arguments of a module
-			// call are named after variables: they keep the names those keep.
-			// An exempt variable's assignment keeps its object keys too.
-			name := on
-			switch {
-			case f.tfvars && pl.top:
-				held, deep := f.exempt.covers([]string{"var", n.Name})
-				on = on && !deep
-				name = on && held == 0 && f.renames("variable")
-			case pl.blockType == "module" && pl.depth == 1:
-				name = on && f.renames("variable") // the child module's variables
+			// call are named after variables, and keep the names those keep.
+			tfvars := f.tfvars && pl.top
+			if tfvars && f.dashed(n.Name) && f.decl().whole["var."+n.Name] {
+				on = false
 			}
-			if name && !f.exempt.names[n.Name] {
+			name := on
+			if tfvars || pl.blockType == "module" && pl.depth == 1 {
+				name = on && f.renames("variable") && !(tfvars && f.dashed(n.Name) && f.decl().kept("var."+n.Name))
+			}
+			if name {
 				n.Name = f.name(n.Name)
 			}
-			f.renameExpr(n.Value, on, iters)
+			if on {
+				f.renameKeys(n.Value)
+			}
+			f.renameRefs(n.Value)
 		case *types.Block:
-			// A declaration exempt with its keys (by a .tfvars marker) keeps
-			// every name in it, as under a marker of its own.
-			_, deep := f.exempt.covers(declares(n))
-			deep = deep && pl.top
-			on = on && !deep
-			inner := iters
-			if n.Type == "dynamic" && len(n.Labels) > 0 {
-				// Its iterator: the label, which keeps its name where the
-				// label does, or the iterator argument's name.
-				inner = with(iters, !on || !f.renames("dynamic"), n.Labels[0])
-				for _, c := range n.Children {
-					if a, ok := c.(*types.Attribute); ok && a.Name == "iterator" {
-						if r, ok := a.Value.(*types.ReferenceExpr); ok && len(r.Parts) == 1 {
-							inner = with(inner, !on, r.Parts[0])
-						}
-					}
-				}
+			if pl.top && n.Type == "variable" && len(n.Labels) > 0 && f.dashed(n.Labels[0]) && f.decl().whole["var."+n.Labels[0]] {
+				on = false
 			}
 			if on {
 				n.Type = f.name(n.Type)
-				// A declaration that a marker elsewhere exempts keeps its name.
-				if i, ok := f.cfg.Naming.Labels[n.Type]; ok && i < len(n.Labels) && !(pl.top && f.exempted(declares(n))) {
+				if i, ok := f.cfg.Naming.Labels[n.Type]; ok && i < len(n.Labels) && n.Type != "provider" {
 					labels := append([]string{}, n.Labels...)
 					labels[i] = f.name(labels[i])
 					n.Labels = labels
 				}
 			}
-			f.renamePlan(e.plan, inner, keep || deep)
+			f.renamePlan(e.plan, keep || !on && n.Type == "variable")
 		}
 	}
 }
@@ -168,210 +159,106 @@ func providerPlace(pl *plan, n types.Body) bool {
 	return false
 }
 
-// exempted reports whether an exemption covers the references that start
-// with p.
-func (f *formatter) exempted(p []string) bool {
-	n, _ := f.exempt.covers(p)
-	return p != nil && n > 0
-}
-
-// with returns iters with more iterator names, which keep their names or
-// not.
-func with(iters map[string]bool, keep bool, names ...string) map[string]bool {
-	out := map[string]bool{}
-	for k, v := range iters {
-		out[k] = v
-	}
-	for _, n := range names {
-		if n != "" {
-			out[n] = keep
-		}
-	}
-	return out
-}
-
-// readName renames a name read through an iterator: each.value, a dynamic
-// block's iterator or a for-expression variable. The formatter cannot tell
-// which declaration such a read reaches, so a name some ignore_naming
-// marker keeps as a key keeps its dashes (D14).
-func (f *formatter) readName(s string) string {
-	if f.exempt.keys[s] {
-		return s
-	}
-	return f.name(s)
-}
-
-// rootRef returns the reference a chain of traversals, indexes and splats
-// starts from, or nil.
-func rootRef(e types.Expression) *types.ReferenceExpr {
-	for {
-		switch x := e.(type) {
-		case *types.ReferenceExpr:
-			return x
-		case *types.RelativeTraversalExpr:
-			e = x.Source
-		case *types.IndexExpr:
-			e = x.Collection
-		case *types.SplatExpr:
-			e = x.Source
-		default:
-			return nil
-		}
-	}
-}
-
-// renameExpr renames, in e: every step of a reference (but the names an
-// exemption keeps, and the names read through an iterator that a marker
-// keeps as keys, see readName), for-expression variables, and unquoted object
-// keys. Quoted text is never renamed. When on is false, the rule is off for
-// e's item: its for-expression variables (and so the references to them)
-// and its object keys stay. iters holds the iterator names around e (see
-// renamePlan).
-func (f *formatter) renameExpr(e types.Expression, on bool, iters map[string]bool) {
+// renameKeys renames the unquoted keys of the objects in e: they are left of
+// a "=". Quoted keys are text and keep their dashes.
+func (f *formatter) renameKeys(e types.Expression) {
 	walk(e, func(x types.Expression) {
-		switch x := x.(type) {
-		case *types.ForArrayExpr:
-			iters = with(iters, !on, x.KeyVar, x.ValueVar)
-		case *types.ForMapExpr:
-			iters = with(iters, !on, x.KeyVar, x.ValueVar)
+		if o, ok := x.(*types.ObjectExpr); ok {
+			for _, it := range o.Items {
+				if k, ok := it.Key.(*types.ReferenceExpr); ok && len(k.Parts) == 1 {
+					k.Parts = []string{f.name(k.Parts[0])}
+				}
+			}
 		}
 	})
-	// iter reports whether ref reads through an iterator (each.value counts
-	// as one), and whether its first part keeps its name.
-	iter := func(ref *types.ReferenceExpr) (keep, ok bool) {
-		if ref == nil {
-			return false, false
-		}
-		if keep, ok := iters[ref.Parts[0]]; ok {
-			return keep, true
-		}
-		return true, ref.Parts[0] == "each"
-	}
-	outputs := f.renames("output")
-	// renamed returns which parts of ref keep their names, and whether the
-	// steps after it are renamed. After module.<name> comes the name of one
-	// of the child module's outputs, which keeps its name when outputs do
-	// (output): the third part, or else the first attribute step after the
-	// reference. What follows it reads the output's value, whose keys the
-	// child renames. A reference through a local alias keeps the local's
-	// name as the local does, and the rest as a read of what the local
-	// aliases would (D16).
-	renamed := func(ref *types.ReferenceExpr) (keep func(int) bool, output, steps bool) {
-		switch {
-		case ref == nil:
-			return func(int) bool { return false }, false, true
-		case len(ref.Parts) == 1 && f.exempt.names[ref.Parts[0]]:
-			return func(int) bool { return true }, false, false
-		}
-		read, alias := f.through(ref.Parts)
-		own, _ := f.exempt.covers(ref.Parts[:min(2, len(ref.Parts))])
-		shift := len(read) - len(ref.Parts) // read[i+shift] is ref.Parts[i], from the third part on
-		n, deep := f.exempt.covers(read)
-		output = !deep && read[0] == "module" && !outputs
-		return func(i int) bool {
-			if alias && i < 2 {
-				return i < own
-			}
-			i += shift
-			return deep || i < n || output && i == 2
-		}, output, !deep
-	}
-	first := map[types.Expression]bool{} // traversals whose first attribute step is an output's name
-	keys := map[types.Expression]bool{}  // traversals that read through an iterator
-	skip := map[types.Expression]bool{}
+}
+
+// renameRefs renames, in e, the name part of each reference to a declaration
+// the rule renames (see rename). Nothing else in a value changes: not the
+// keys a reference reads (var.x.my-key), the names read through each.value,
+// an iterator or a for-expression variable, the outputs of modules the
+// formatter does not format, nor the old address in a moved or removed
+// block, which no declaration names.
+func (f *formatter) renameRefs(e types.Expression) {
+	keys := map[types.Expression]bool{}
 	walk(e, func(x types.Expression) {
-		if skip[x] {
-			return
-		}
 		switch x := x.(type) {
 		case *types.ObjectExpr:
-			for _, item := range x.Items {
-				if k, ok := item.Key.(*types.ReferenceExpr); ok && len(k.Parts) == 1 && !on {
-					skip[k] = true
-				}
+			for _, it := range x.Items {
+				keys[it.Key] = true
 			}
 		case *types.ReferenceExpr:
-			parts := append([]string{}, x.Parts...)
-			if keep, ok := iter(x); ok {
-				for i := range parts {
-					if i > 0 {
-						parts[i] = f.readName(parts[i])
-					} else if !keep {
-						parts[i] = f.name(parts[i])
-					}
+			if !keys[x] {
+				x.Parts = f.refParts(x.Parts)
+			}
+		case *types.RelativeTraversalExpr: // module.<name>[i].<output>
+			if m := moduleCall(x.Source); m != "" {
+				f.renameOutput(m, x.Traversal)
+			}
+		case *types.SplatExpr: // module.<name>[*].<output>
+			if t, ok := x.Each.(*types.RelativeTraversalExpr); ok {
+				if m := moduleCall(x.Source); m != "" {
+					f.renameOutput(m, t.Traversal)
 				}
-				x.Parts = parts
-				break
-			}
-			keep, _, _ := renamed(x)
-			for i := range parts {
-				if !keep(i) {
-					parts[i] = f.name(parts[i])
-				}
-			}
-			x.Parts = parts
-		case *types.RelativeTraversalExpr:
-			if _, ok := iter(rootRef(x.Source)); ok || keys[x] {
-				f.renameSteps(x.Traversal, false, f.readName)
-				break
-			}
-			_, output, steps := renamed(rootRef(x.Source))
-			first[x] = first[x] || output && !f.readsOutput(x.Source)
-			if steps {
-				f.renameSteps(x.Traversal, first[x], f.name)
-			}
-		case *types.SplatExpr:
-			if _, ok := iter(rootRef(x.Source)); ok {
-				walk(x.Each, func(y types.Expression) { keys[y] = true })
-				break
-			}
-			_, output, steps := renamed(rootRef(x.Source))
-			if !steps {
-				walk(x.Each, func(y types.Expression) { skip[y] = true })
-			} else if each, ok := x.Each.(*types.RelativeTraversalExpr); ok && output && !f.readsOutput(x.Source) {
-				first[each] = true
-			}
-		case *types.ForArrayExpr:
-			if on {
-				x.KeyVar, x.ValueVar = f.name(x.KeyVar), f.name(x.ValueVar)
-			}
-		case *types.ForMapExpr:
-			if on {
-				x.KeyVar, x.ValueVar = f.name(x.KeyVar), f.name(x.ValueVar)
 			}
 		}
 	})
 }
 
-// renameSteps renames the attribute steps of a traversal with rename, but
-// the first one when keepFirst.
-func (f *formatter) renameSteps(steps []types.TraversalElem, keepFirst bool, rename func(string) string) {
-	for i := range steps {
-		if steps[i].Type == "attr" {
-			if !keepFirst {
-				steps[i].Name = rename(steps[i].Name)
+// refParts returns a reference's parts with its name part renamed when it
+// names a declaration the rule renames.
+func (f *formatter) refParts(parts []string) []string {
+	p := append([]string{}, parts...)
+	at := func(i int) {
+		if i < len(p) && f.dashed(p[i]) && f.decl().renames(strings.Join(parts[:i+1], ".")) {
+			p[i] = f.name(p[i])
+		}
+	}
+	if len(p) < 2 {
+		return p
+	}
+	switch p[0] {
+	case "module":
+		if len(p) > 2 && f.childRenames(parts[1], parts[2]) {
+			p[2] = f.name(p[2])
+		}
+		at(1)
+	case "data", "ephemeral":
+		at(2)
+	default: // var, local and <type>
+		at(1)
+	}
+	return p
+}
+
+// moduleCall returns <name> when e is module.<name>, indexed or not.
+func moduleCall(e types.Expression) string {
+	for {
+		switch x := e.(type) {
+		case *types.IndexExpr:
+			e = x.Collection
+		case *types.ReferenceExpr:
+			if len(x.Parts) == 2 && x.Parts[0] == "module" {
+				return x.Parts[1]
 			}
-			keepFirst = false
+			return ""
+		default:
+			return ""
 		}
 	}
 }
 
-// readsOutput reports whether a chain that starts at module.<name>, or at a
-// local alias of it, has an attribute step after those two parts: the name
-// of the output it reads.
-func (f *formatter) readsOutput(e types.Expression) bool {
-	switch x := e.(type) {
-	case *types.ReferenceExpr:
-		read, _ := f.through(x.Parts)
-		return len(read) > 2
-	case *types.RelativeTraversalExpr:
-		return f.readsOutput(x.Source) || slices.ContainsFunc(x.Traversal, func(s types.TraversalElem) bool { return s.Type == "attr" })
-	case *types.IndexExpr:
-		return f.readsOutput(x.Collection)
-	case *types.SplatExpr:
-		return f.readsOutput(x.Source) || f.readsOutput(x.Each)
+// renameOutput renames the first attribute step after module.<m>: the
+// output it reads, when the local child module renames it.
+func (f *formatter) renameOutput(m string, steps []types.TraversalElem) {
+	for i := range steps {
+		if steps[i].Type == "attr" {
+			if f.childRenames(m, steps[i].Name) {
+				steps[i].Name = f.name(steps[i].Name)
+			}
+			return
+		}
 	}
-	return false
 }
 
 // ---- Object keys ----

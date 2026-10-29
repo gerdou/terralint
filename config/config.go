@@ -51,43 +51,14 @@ type Naming struct {
 	Replace string `yaml:"replace"`
 	With    string `yaml:"with"`
 	// Labels gives, by block type, the index of the label that names the
-	// block (the second label of a resource; the first of a variable), which
-	// is where Terraform puts the name. A type left out keeps its names, and
-	// so do the references to them in every file of the directory; without
-	// "variable", so do .tfvars assignments and module call arguments.
-	// Without "dynamic", a dynamic block's iterator keeps its name.
-	//
-	// The names read through an iterator (each.value.<key>, a dynamic
-	// block's <iterator>.value.<key>, a for-expression variable's <v>.<key>)
-	// are not traced to what declares them: they are renamed, inside items
-	// under ignore_naming too, unless some ignore_naming marker in the
-	// directory keeps a name like them (a key of a marked locals entry; a
-	// key of a variable marked on its declaration or on a .tfvars
-	// assignment, written in the declaration or in any assignment, since
-	// either marker keeps both; or a name inside a marked item).
-	//
-	// A local whose value is a plain reference path (local.pool =
-	// var.pools["default"]: a reference with indexes and attribute steps
-	// only) is an alias: the steps read through it keep or lose their
-	// names as reads of what it aliases would, whatever marker the local
-	// carries (its own name follows its own). Reads through a local built
-	// otherwise (a call, an object, a conditional) follow the local's
-	// marker, and are not traced further.
-	//
-	// Without "output", a read of a module call's output keeps the output's
-	// name (module.<name>.<output>, after an index or [*] too), and the keys
-	// read after it are renamed, as the child renames its output's value.
-	// Reads that do not start at module.<name> (or at a local alias of it)
-	// are renamed in full, because the formatter cannot tell they read an
-	// output, and then no longer match it: through a for-expression
-	// variable ([for m in module.x : m.out]), a function's result
-	// (values(module.x)[0].out) or remote state (outputs.<name>).
-	//
-	// "provider" is left out by default: provider local names keep their
-	// dashes wherever they appear (required_providers and everything in it,
-	// provider block labels, the provider and providers meta-arguments),
-	// because Terraform rejects "_" in them (google_beta fails terraform
-	// init). With "provider" here, they are renamed in all those places.
+	// block (the second label of a resource; the first of a variable). The
+	// rule renames names only, never values: everything left of a "=" and
+	// these labels. In a value, only the name part of a reference to a name
+	// the directory declares and renames follows it (var.<name>,
+	// <type>.<name>, an output of a local child module, ...). A type left out
+	// keeps its labels and the references to them; without "variable",
+	// .tfvars assignments and module call arguments keep their names too.
+	// Provider local names are never renamed: Terraform rejects "_" in them.
 	Labels map[string]int `yaml:"labels"`
 }
 
@@ -150,7 +121,7 @@ func Default() *Config {
 		Naming: Naming{
 			Replace: "-",
 			With:    "_",
-			Labels:  map[string]int{"variable": 0, "output": 0, "module": 0, "dynamic": 0, "resource": 1, "data": 1, "ephemeral": 1},
+			Labels:  map[string]int{"variable": 0, "output": 0, "module": 0, "resource": 1, "data": 1, "ephemeral": 1},
 		},
 		TopLevel: topLevel,
 		Priorities: map[string]Priority{
