@@ -51,6 +51,7 @@ type section struct {
 	entries []*entry
 	tail    []string // the comment lines after the last item, and the closing marker
 	anchor  any      // the *entry or *section before it in the source; nil at the start of the body, endOfBody at its end
+	before  *entry   // when set, the section goes right before this item instead (see keepTypeOrder)
 	off     offSet
 	chained bool // the next section's opening marker ended it, so that section must follow it
 }
@@ -85,12 +86,17 @@ type unit struct {
 	sec   *section
 }
 
-// units returns the body in printing order: each section right after the
-// item or section that preceded it in the source.
+// units returns the body in printing order: each section right after its
+// anchor, the item or section that preceded it in the source, or right
+// before the item keepTypeOrder chose.
 func (pl *plan) units() []unit {
-	after := map[any][]*section{}
+	after, before := map[any][]*section{}, map[*entry][]*section{}
 	for _, s := range pl.sections {
-		after[s.anchor] = append(after[s.anchor], s)
+		if s.before != nil {
+			before[s.before] = append(before[s.before], s)
+		} else {
+			after[s.anchor] = append(after[s.anchor], s)
+		}
 	}
 	var out []unit
 	var follow func(anchor any)
@@ -102,11 +108,70 @@ func (pl *plan) units() []unit {
 	}
 	follow(nil)
 	for _, e := range pl.free {
+		for _, s := range before[e] {
+			out = append(out, unit{sec: s})
+			follow(s)
+		}
 		out = append(out, unit{entry: e})
 		follow(e)
 	}
 	follow(endOfBody)
 	return out
+}
+
+// keepTypeOrder moves the sections of a block's body that hold nested
+// blocks of a type also found outside them, so that the blocks of that type
+// keep their source order whatever the anchor sorts to (D15): right after
+// the last such block before the section (or the section holding it), or
+// else right before the first such block after it. The first such type in
+// the section decides. Sections that must stay where they are, at the end
+// of the body or after the section they end, keep their anchor.
+func (pl *plan) keepTypeOrder() {
+	holder := map[*entry]any{}
+	for _, e := range pl.free {
+		holder[e] = e
+	}
+	for _, s := range pl.sections {
+		for _, e := range s.entries {
+			holder[e] = s
+		}
+	}
+	all := pl.all()
+	sort.SliceStable(all, func(i, j int) bool { return start(all[i].node) < start(all[j].node) })
+	blockType := func(e *entry) string {
+		if b, ok := e.node.(*types.Block); ok {
+			return strings.ToLower(effectiveType(b))
+		}
+		return ""
+	}
+	for _, s := range pl.sections {
+		if prev, ok := s.anchor.(*section); s.anchor == endOfBody || ok && prev.chained {
+			continue
+		}
+		for _, e := range s.entries {
+			t := blockType(e)
+			var last, next *entry
+			for _, o := range all {
+				if t == "" || holder[o] == s || blockType(o) != t {
+					continue
+				}
+				if start(o.node) < start(e.node) {
+					last = o
+				} else if next == nil {
+					next = o
+				}
+			}
+			if last == nil && next == nil {
+				continue
+			}
+			if last != nil {
+				s.anchor = holder[last]
+			} else if holder[next] == next {
+				s.before = next
+			} // else a section holds it, which follows this one when that type decides for it
+			break
+		}
+	}
 }
 
 func lines(s string) []string {
@@ -292,6 +357,9 @@ func (f *formatter) planBody(children []types.Body, end string, off offSet, bloc
 			s = before
 		}
 		s.anchor = endOfBody
+	}
+	if depth > 0 {
+		pl.keepTypeOrder()
 	}
 	return pl
 }

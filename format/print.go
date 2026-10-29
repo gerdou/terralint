@@ -8,6 +8,7 @@ import (
 	"unicode"
 
 	"github.com/gerdou/terralint/config"
+	"github.com/gerdou/terralint/parser"
 	"github.com/gerdou/terralint/parser/types"
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/zclconf/go-cty/cty"
@@ -27,11 +28,31 @@ type printer struct {
 	// so that a call or list can tell whether an argument holds any.
 	inlined int
 	// endTail is the last tail comment printed in place, with the space
-	// before it, for arg.
+	// before it, for arg; endOnly says it was the only comment of its
+	// expression.
 	endTail string
+	endOnly bool
 	// inTemplate is set while printing the expressions of a template's
 	// interpolations and directives.
 	inTemplate bool
+	// texts holds what expr printed for each expression, and force the
+	// calls, parentheses and for expressions that must break after their
+	// opening bracket (see settle).
+	texts map[types.Expression]string
+	force map[types.Expression]bool
+	// items holds the object items printed, which print the same each time
+	// settle prints their item again.
+	items map[*types.ObjectItem]printedItem
+}
+
+type printedItem struct {
+	text      string
+	commented bool
+	inlined   int
+}
+
+func newPrinter(cfg *config.Config, text map[types.Expression][]types.TextPiece) *printer {
+	return &printer{cfg: cfg, text: text, texts: map[types.Expression]string{}, force: map[types.Expression]bool{}, items: map[*types.ObjectItem]printedItem{}}
 }
 
 func (p *printer) on(rule string) bool { return p.cfg.On(rule) && !p.off[rule] }
@@ -109,7 +130,6 @@ var heredocOpener = regexp.MustCompile(`<<-?[A-Za-z_][A-Za-z0-9_-]*$`)
 func place(above []string, text string, inline, trail []string) string {
 	ls := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
 	closed := strings.HasSuffix(text, "\n") // ends in a heredoc's closing line
-	one := func(c []string) bool { return len(c) == 1 && !strings.Contains(c[0], "\n") }
 	if len(ls) == 1 && !closed {
 		ends := append(append([]string{}, inline...), trail...)
 		if len(ends) > 0 && one(ends[:1]) {
@@ -130,6 +150,91 @@ func place(above []string, text string, inline, trail []string) string {
 		}
 	}
 	return strings.Join(append(above, ls...), "\n")
+}
+
+// one reports whether comment lines c are a single line.
+func one(c []string) bool { return len(c) == 1 && !strings.Contains(c[0], "\n") }
+
+// settle prints an item with print, which returns its text, and decides
+// where its inline comment goes. It ends the item's first line only where
+// parsing the output again gives it back to the item (D13): not after an
+// argument of a call has started on that line, nor after the { of an
+// object that is not the item's whole value. The value is printed again
+// with the outermost such call one argument per line, or with the
+// parentheses or for expression around such an object broken after their
+// opening bracket; when that does not help, the comment goes with the
+// trailing ones, after the value's end, where it is the item's too.
+func (p *printer) settle(value types.Expression, print func() string, inline, trail []string) (string, []string, []string) {
+	text := print()
+	if !one(inline) || !strings.Contains(strings.TrimSuffix(text, "\n"), "\n") || owns(text) {
+		return text, inline, trail
+	}
+	if x := p.opener(value, true, nil); x != nil {
+		p.force[x] = true
+		forced := print()
+		delete(p.force, x)
+		if owns(forced) {
+			return forced, inline, trail
+		}
+	}
+	// The forced print hoisted the same comments as the first.
+	return text, nil, append(inline, trail...)
+}
+
+// owns reports whether a comment at the end of the first line of text, an
+// attribute or object item as printed, is the item's own when parsed.
+func owns(text string) bool {
+	first, rest, _ := strings.Cut(text, "\n")
+	root, err := parser.Parse([]byte("x = {\n"+first+" # c\n"+rest+"\n}\n"), "item.tf")
+	if err != nil || len(root.Children) != 1 {
+		return false
+	}
+	a, ok := root.Children[0].(*types.Attribute)
+	if !ok {
+		return false
+	}
+	o, ok := a.Value.(*types.ObjectExpr)
+	return ok && len(o.Items) == 1 && o.Items[0].InlineComment == "c" && !o.Items[0].InlineInside
+}
+
+// opener returns what to break after its opening bracket so that the first
+// line of e's text (as printed last) no longer ends inside a part of the
+// value: the outermost call whose arguments start on that line, or, when
+// an object that is not the item's value (value) opens there first, the
+// outermost parentheses or for expression around it (around). nil when
+// there is none.
+func (p *printer) opener(e types.Expression, value bool, around types.Expression) types.Expression {
+	s := p.texts[e]
+	if !strings.Contains(s, "\n") {
+		return nil
+	}
+	switch x := e.(type) {
+	case *types.FunctionCallExpr:
+		if strings.HasPrefix(s, x.Name+"(\n") {
+			return nil
+		}
+		return x
+	case *types.ObjectExpr:
+		if value {
+			return nil
+		}
+		return around
+	case *types.ParenExpr, *types.ForArrayExpr, *types.ForMapExpr:
+		if s[1] == '\n' { // broken after its bracket already
+			return nil
+		}
+		if around == nil {
+			around = e
+		}
+	case *types.ArrayExpr, *types.TemplateExpr, *types.HeredocExpr, *types.LiteralValue:
+		return nil
+	}
+	for _, x := range parts(e) {
+		if x != nil && strings.Contains(p.texts[x], "\n") {
+			return p.opener(x, false, around)
+		}
+	}
+	return nil
 }
 
 // ---- Bodies ----
@@ -280,8 +385,15 @@ func (p *printer) entry(f *formatter, pl *plan, e *entry) chunk {
 	var inline, trail []string
 	switch n := e.node.(type) {
 	case *types.Attribute:
-		text = n.Name + " = " + p.value(n, pl)
-		inline, trail = p.inline(n.InlineComment, n.InlineInside), p.comments(n.TrailComment)
+		root := n.Value
+		if t, ok := n.Value.(*types.TemplateExpr); ok && len(p.text[t]) == 1 && p.text[t][0].Kind == "interp" {
+			root = p.text[t][0].Expr // value prints it alone
+		}
+		print := func() string {
+			hoisted = hoisted[:0]
+			return n.Name + " = " + p.value(n, pl)
+		}
+		text, inline, trail = p.settle(root, print, p.inline(n.InlineComment, n.InlineInside), p.comments(n.TrailComment))
 	case *types.Block:
 		if n.Type == "" { // a file of comments only
 			return chunk{text: strings.Join(above, "\n"), entry: e}
@@ -399,6 +511,7 @@ func (p *printer) withComments(e types.Expression, s string, nl bool) string {
 		p.endTail = " " + tail[0]
 		s += p.endTail + "\n"
 		tail = tail[1:]
+		p.endOnly = len(lead) == 0 && len(tail) == 0
 	}
 	if above := append(lead, tail...); len(above) > 0 {
 		s = "\n" + strings.Join(above, "\n") + "\n" + strings.TrimPrefix(s, "\n")
@@ -409,6 +522,21 @@ func (p *printer) withComments(e types.Expression, s string, nl bool) string {
 // expr prints e without its own comments. nl tells whether a line break is
 // allowed around e (inside brackets) or not (in an item's value).
 func (p *printer) expr(e types.Expression, nl bool) string {
+	s := p.layout(e, nl)
+	p.texts[e] = s
+	return s
+}
+
+// since returns p.inlined, less one when settle asks e to break after its
+// opening bracket, so that wrap breaks it as if a comment were inside.
+func (p *printer) since(e types.Expression) int {
+	if p.force[e] {
+		return p.inlined - 1
+	}
+	return p.inlined
+}
+
+func (p *printer) layout(e types.Expression, nl bool) string {
 	switch e := e.(type) {
 	case *types.LiteralValue:
 		return p.literal(e)
@@ -439,7 +567,7 @@ func (p *printer) expr(e types.Expression, nl bool) string {
 	case *types.IndexExpr:
 		return p.postfixSource(e.Collection, nl) + "[" + p.sub(e.Key, false) + "]"
 	case *types.ParenExpr:
-		n := p.inlined
+		n := p.since(e)
 		return p.wrap(n, "(", p.sub(e.Expression, true), ")")
 	case *types.UnaryExpr:
 		return e.Operator + p.sub(e.Expr, nl)
@@ -448,14 +576,14 @@ func (p *printer) expr(e types.Expression, nl bool) string {
 	case *types.ConditionalExpr:
 		return p.sub(e.Condition, nl) + " ? " + p.sub(e.TrueExpr, nl) + " : " + p.sub(e.FalseExpr, nl)
 	case *types.ForArrayExpr:
-		n := p.inlined
+		n := p.since(e)
 		s := "for " + forVars(e.KeyVar, e.ValueVar) + " in " + p.sub(e.Collection, true) + " : " + p.sub(e.ThenValueExpr, true)
 		if e.Condition != nil {
 			s += " if " + p.sub(e.Condition, true)
 		}
 		return p.wrap(n, "[", s, "]")
 	case *types.ForMapExpr:
-		n := p.inlined
+		n := p.since(e)
 		s := "for " + forVars(e.KeyVar, e.ValueVar) + " in " + p.sub(e.Collection, true) + " : " + p.sub(e.ThenKeyExpr, true) + " => " + p.sub(e.ThenValueExpr, true)
 		if e.Group {
 			s += "..."
@@ -625,7 +753,7 @@ func (p *printer) list(a *types.ArrayExpr) string {
 		n := p.inlined
 		elems[i], ends[i] = p.arg(x)
 		c := exprComments(x)
-		commented = commented || c.LeadComment != "" || c.TailComment != "" || p.inlined > n
+		commented = commented || c.LeadComment != "" || c.TailComment != "" || ends[i] != "" || p.inlined > n
 		multi = multi || strings.Contains(elems[i], "\n")
 	}
 	one := "[" + strings.Join(elems, ", ") + "]"
@@ -659,6 +787,11 @@ func (p *printer) arg(x types.Expression) (s, end string) {
 	p.endTail = ""
 	s = p.expr(x, true)
 	if p.endTail != "" && strings.HasSuffix(s, p.endTail+"\n") {
+		if p.endOnly {
+			// It prints as the element's own tail comment, which parses
+			// back as one; those do not count as printed in place either.
+			p.inlined--
+		}
 		return strings.TrimSuffix(s, p.endTail+"\n"), p.endTail[1:]
 	}
 	return s, ""
@@ -698,14 +831,14 @@ func (p *printer) call(f *types.FunctionCallExpr) string {
 		n := p.inlined
 		args[i], ends[i] = p.arg(x)
 		c := exprComments(x)
-		commented = commented || c.LeadComment != "" || c.TailComment != "" || p.inlined > n
+		commented = commented || c.LeadComment != "" || c.TailComment != "" || ends[i] != "" || p.inlined > n
 		multi = multi || i < len(f.Args)-1 && strings.Contains(args[i], "\n")
 	}
 	expand := ""
 	if f.ExpandFinal {
 		expand = "..."
 	}
-	if !commented && !multi {
+	if !commented && !multi && !p.force[f] {
 		return f.Name + "(" + strings.Join(args, ", ") + expand + ")"
 	}
 	var b strings.Builder
@@ -765,15 +898,24 @@ func (p *printer) object(o *types.ObjectExpr) string {
 // objectItem prints an object item with its comments, and tells whether it
 // has any.
 func (p *printer) objectItem(it *types.ObjectItem) (string, bool) {
+	if done, ok := p.items[it]; ok {
+		p.inlined += done.inlined
+		return done.text, done.commented
+	}
 	save := p.hoist
 	var hoisted []string
 	p.hoist = &hoisted
 	n := p.inlined
-	text := p.sub(it.Key, false) + " = " + p.sub(it.Value, false)
+	print := func() string {
+		hoisted = hoisted[:0]
+		return p.sub(it.Key, false) + " = " + p.sub(it.Value, false)
+	}
+	text, inline, trail := p.settle(it.Value, print, p.inline(it.InlineComment, it.InlineInside), p.comments(it.TrailComment))
 	p.hoist = save
 	above := append(p.comments(it.BlockComment), hoisted...)
-	inline, trail := p.inline(it.InlineComment, it.InlineInside), p.comments(it.TrailComment)
-	return place(above, text, inline, trail), len(above)+len(inline)+len(trail) > 0 || p.inlined > n
+	done := printedItem{place(above, text, inline, trail), len(above)+len(inline)+len(trail) > 0 || p.inlined > n, p.inlined - n}
+	p.items[it] = done
+	return done.text, done.commented
 }
 
 // keyText is how an object key sorts: its name, its string, or its text.

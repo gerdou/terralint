@@ -21,7 +21,11 @@ func ParseTerraformFile(filePath string) (*types.Root, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read file: %w", err)
 	}
+	return Parse(content, filePath)
+}
 
+// Parse parses Terraform source into an AST; filePath names it in errors.
+func Parse(content []byte, filePath string) (*types.Root, error) {
 	file, diags := hclsyntax.ParseConfig(content, filePath, hcl.InitialPos)
 	if diags.HasErrors() {
 		return nil, fmt.Errorf("failed to parse HCL: %s", diags.Error())
@@ -53,6 +57,7 @@ func ParseTerraformFile(filePath string) (*types.Root, error) {
 		return root, nil
 	}
 
+	var err error
 	root.Children, root.EndComment, err = c.body(body, 0, 0, len(content))
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", filePath, err)
@@ -149,32 +154,46 @@ func (c *converter) inline(start hcl.Pos, limit int) (text string, index int, in
 }
 
 // inValue gives an item's inline comment (index i, -1 for none) to the part
-// of the item's list or call value it is in or next to, when it comes after
-// the start of the first element and before the end of the value: the
-// printer may put the elements on lines of their own, and the comment must
-// stay with its element there (on the line [{ # label, after the {; after
-// "a", # note, after "a"). It reports whether it did; the item's copy is then
-// not printed.
+// of the item's value it belongs to by position, wherever in the value it
+// is (D13). The outermost list, call or object of the value that holds the
+// comment decides: a list or call when one of its elements has started
+// before the comment (on the line [{ # label, after the {; after "a", #
+// note, after "a"), an object that is not the whole value (var.c ? { #
+// label). Before the first element, after the value's end, or outside
+// every list, call and object, the comment stays the item's. inValue
+// reports whether it gave the comment away; the item's copy is then not
+// printed. The printer places an item's own comment only where this gives
+// it back to the item.
 func (c *converter) inValue(value types.Expression, i int) bool {
-	var first types.Expression
-	switch v := value.(type) {
-	case *types.ArrayExpr:
-		if len(v.Items) > 0 {
-			first = v.Items[0]
-		}
-	case *types.FunctionCallExpr:
-		if len(v.Args) > 0 {
-			first = v.Args[0]
-		}
-	}
-	if i < 0 || first == nil {
+	if i < 0 {
 		return false
 	}
-	if pos := c.comments[i].Range.Start.Byte; pos < first.Range().Start.Byte || pos >= value.Range().End.Byte {
-		return false
+	pos := c.comments[i].Range.Start.Byte
+	holds := func(e types.Expression) bool { return e.Range().Start.Byte <= pos && pos < e.Range().End.Byte }
+	for e := value; e != nil && holds(e); {
+		switch e.(type) {
+		case *types.ArrayExpr, *types.FunctionCallExpr:
+			if parts := c.children(e); len(parts) == 0 || pos < parts[0].Range().Start.Byte {
+				return false
+			}
+			c.attach(value, []int{i})
+			return true
+		case *types.ObjectExpr:
+			if e == value {
+				return false
+			}
+			c.attach(value, []int{i})
+			return true
+		}
+		var next types.Expression
+		for _, ch := range c.children(e) {
+			if holds(ch) {
+				next = ch
+			}
+		}
+		e = next
 	}
-	c.attach(value, []int{i})
-	return true
+	return false
 }
 
 // lastLine is the line a comment ends on; a line comment's token takes in

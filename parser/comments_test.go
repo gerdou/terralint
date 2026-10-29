@@ -262,6 +262,71 @@ resource "a" "b" {
 	}
 }
 
+// holder returns the name of the field that holds the comment text, as
+// heldComments walks them.
+func holder(v reflect.Value, text string) string {
+	switch v.Kind() {
+	case reflect.Interface, reflect.Ptr:
+		if !v.IsNil() {
+			return holder(v.Elem(), text)
+		}
+	case reflect.Struct:
+		if v.Type() == reflect.TypeOf(hcl.Range{}) {
+			return ""
+		}
+		for i := 0; i < v.NumField(); i++ {
+			f := v.Type().Field(i)
+			if f.Type.Kind() == reflect.String && strings.HasSuffix(f.Name, "Comment") {
+				if inside := v.FieldByName("InlineInside"); f.Name == "InlineComment" && inside.IsValid() && inside.Bool() {
+					continue
+				}
+				if v.Field(i).String() == text {
+					return f.Name
+				}
+				continue
+			}
+			if h := holder(v.Field(i), text); h != "" {
+				return h
+			}
+		}
+	case reflect.Slice:
+		for i := 0; i < v.Len(); i++ {
+			if h := holder(v.Index(i), text); h != "" {
+				return h
+			}
+		}
+	}
+	return ""
+}
+
+// An item's end-of-line comment on its first line belongs to the part of
+// the value it follows, wherever the list, call or object sits (D13): after
+// an element's start, to that element; after the { of an object that is
+// not the whole value, to that object; else (before the first element,
+// after the value's end) to the item.
+func TestInlineOwner(t *testing.T) {
+	for _, c := range []struct{ value, want string }{
+		{"merge(var.a, { b = 1 }) # c", "InlineComment"},
+		{"merge( # c\n  var.a, { b = 1 })", "InlineComment"},
+		{"var.on ? [ # c\n  \"a\"] : []", "InlineComment"},
+		{"{ # c\n  a = 1 }", "InlineComment"},
+		{"var.on ? [\"a\", # c\n  \"b\"] : []", "TailComment"},
+		{"([\"a\", # c\n  \"b\"])", "TailComment"},
+		{"[[\"a\", # c\n  \"b\"]][0]", "TailComment"},
+		{"var.on ? [{ # c\n  a = 1 }] : []", "OpenComment"},
+		{"var.on ? { # c\n  a = 1 } : {}", "OpenComment"},
+		{"{ # c\n  a = 1 }[var.k]", "OpenComment"},
+		{"merge(var.a, { # c\n  b = 1 })", "OpenComment"},
+	} {
+		src := "x = " + c.value + "\n"
+		root := parseSource(t, src)
+		checkHeld(t, c.value, []byte(src), root)
+		if got := holder(reflect.ValueOf(root), "c"); got != c.want {
+			t.Errorf("%s: held as %s, want %s", c.value, got, c.want)
+		}
+	}
+}
+
 // How comments are held: a # or // comment without its marker and one
 // space, unless that text would read as another comment.
 func TestCommentText(t *testing.T) {

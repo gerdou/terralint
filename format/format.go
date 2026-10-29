@@ -38,7 +38,7 @@ func File(path string, cfg *config.Config) ([]byte, error) {
 	f.sortObjects(top)
 	f.order(top)
 
-	p := &printer{cfg: cfg, text: root.Text}
+	p := newPrinter(cfg, root.Text)
 	return hclwrite.Format(p.file(f, top)), nil
 }
 
@@ -62,6 +62,7 @@ func (f *formatter) on(off offSet, rule string) bool {
 type exemptions struct {
 	prefixes []prefix
 	names    map[string]bool
+	keys     map[string]bool // the names inside the items under ignore_naming (see formatter.readName)
 }
 
 // prefix is the start of the references to an exempt name. When deep, the
@@ -82,7 +83,7 @@ var declaring = []string{"variable", "module", "resource", "data", "ephemeral"}
 // word are not parsed, unless a declaring block type is missing from
 // Naming.Labels; files that do not parse are skipped.
 func (f *formatter) exemptions(path string) *exemptions {
-	ex := &exemptions{names: map[string]bool{}}
+	ex := &exemptions{names: map[string]bool{}, keys: map[string]bool{}}
 	word := []byte(f.cfg.IgnorePrefix + config.RuleNaming)
 	every := false
 	for _, t := range declaring {
@@ -111,9 +112,15 @@ func (f *formatter) exemptions(path string) *exemptions {
 			}
 		}
 		of := &formatter{cfg: f.cfg, root: root, tfvars: filepath.Ext(other) == ".tfvars"}
-		for _, e := range of.planFile().all() {
+		top := of.planFile()
+		for _, e := range top.all() {
 			ex.collect(of, e)
 		}
+		visit(top, func(e *entry, _ *plan) {
+			if !of.on(e.off, config.RuleNaming) {
+				ex.keep(e.node)
+			}
+		})
 	}
 	return ex
 }
@@ -152,6 +159,27 @@ func (ex *exemptions) collect(f *formatter, e *entry) {
 				}
 			}
 		}
+	}
+}
+
+// keep records the names an item under ignore_naming keeps: its name or
+// type, and the unquoted object keys in its value. Inside a marked block,
+// visit reaches the items, which are under the marker too.
+func (ex *exemptions) keep(n types.Body) {
+	switch n := n.(type) {
+	case *types.Attribute:
+		ex.keys[n.Name] = true
+		walk(n.Value, func(x types.Expression) {
+			if o, ok := x.(*types.ObjectExpr); ok {
+				for _, it := range o.Items {
+					if k, ok := it.Key.(*types.ReferenceExpr); ok && len(k.Parts) == 1 {
+						ex.keys[k.Parts[0]] = true
+					}
+				}
+			}
+		})
+	case *types.Block:
+		ex.keys[n.Type] = true
 	}
 }
 

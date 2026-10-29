@@ -67,7 +67,7 @@ type Attribute struct {
 	Value         Expression // The value of the attribute
 	Range         hcl.Range
 	InlineComment string // The first comment on the attribute's first line, after its start and before the next sibling or the container's end
-	InlineInside  bool   // InlineComment is also held inside the value, which prints it: as the InlineComment of an object item there that starts on the same line, or, when it comes after the first element of a list or call value starts, as a comment of that list's or call's parts; it follows that item or part
+	InlineInside  bool   // InlineComment is also held inside the value, which prints it: as the InlineComment of an object item there that starts on the same line, or as a comment of the part of the value it belongs to by position, wherever in the value that part is: when the outermost list or call around it has an element that started before it, that element (or a part of it); when that is an object that is not the whole value, that object (D13). It follows that item or part
 	BlockComment  string // The comments on the lines between the previous sibling (or the container's start) and the attribute, one per line
 	TrailComment  string // The comments after the attribute on its last line, besides InlineComment
 }

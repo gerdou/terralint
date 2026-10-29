@@ -15,43 +15,49 @@ func walk(e types.Expression, fn func(types.Expression)) {
 		return
 	}
 	fn(e)
-	each := func(xs ...types.Expression) {
-		for _, x := range xs {
-			walk(x, fn)
-		}
+	for _, x := range parts(e) {
+		walk(x, fn)
 	}
+}
+
+// parts returns the expressions directly inside e, in the order they
+// print; nil stands for an absent one.
+func parts(e types.Expression) []types.Expression {
 	switch e := e.(type) {
 	case *types.ObjectExpr:
+		var out []types.Expression
 		for _, item := range e.Items {
-			each(item.Key, item.Value)
+			out = append(out, item.Key, item.Value)
 		}
+		return out
 	case *types.ArrayExpr:
-		each(e.Items...)
+		return e.Items
 	case *types.FunctionCallExpr:
-		each(e.Args...)
+		return e.Args
 	case *types.TemplateExpr:
-		each(e.Parts...)
+		return e.Parts
 	case *types.HeredocExpr:
-		each(e.Parts...)
+		return e.Parts
 	case *types.ConditionalExpr:
-		each(e.Condition, e.TrueExpr, e.FalseExpr)
+		return []types.Expression{e.Condition, e.TrueExpr, e.FalseExpr}
 	case *types.BinaryExpr:
-		each(e.Left, e.Right)
+		return []types.Expression{e.Left, e.Right}
 	case *types.UnaryExpr:
-		each(e.Expr)
+		return []types.Expression{e.Expr}
 	case *types.ParenExpr:
-		each(e.Expression)
+		return []types.Expression{e.Expression}
 	case *types.ForArrayExpr:
-		each(e.Collection, e.ThenValueExpr, e.Condition)
+		return []types.Expression{e.Collection, e.ThenValueExpr, e.Condition}
 	case *types.ForMapExpr:
-		each(e.Collection, e.ThenKeyExpr, e.ThenValueExpr, e.Condition)
+		return []types.Expression{e.Collection, e.ThenKeyExpr, e.ThenValueExpr, e.Condition}
 	case *types.SplatExpr:
-		each(e.Source, e.Each)
+		return []types.Expression{e.Source, e.Each}
 	case *types.IndexExpr:
-		each(e.Collection, e.Key)
+		return []types.Expression{e.Collection, e.Key}
 	case *types.RelativeTraversalExpr:
-		each(e.Source)
+		return []types.Expression{e.Source}
 	}
+	return nil
 }
 
 // visit calls fn on every entry of the body and the bodies inside it.
@@ -82,10 +88,10 @@ func (f *formatter) rename(top *plan) {
 	f.renamePlan(top, nil, false)
 }
 
-// renamePlan renames in a body. kept holds the iterator names of the
-// dynamic blocks around it that keep their names; keep says the rule is off
-// for the whole body.
-func (f *formatter) renamePlan(pl *plan, kept map[string]bool, keep bool) {
+// renamePlan renames in a body. iters holds the iterator names of the
+// dynamic blocks around it, true for those that keep their names; keep says
+// the rule is off for the whole body.
+func (f *formatter) renamePlan(pl *plan, iters map[string]bool, keep bool) {
 	providers := f.renames("provider")
 	for _, e := range pl.all() {
 		on := !keep && f.on(e.off, config.RuleNaming)
@@ -109,14 +115,26 @@ func (f *formatter) renamePlan(pl *plan, kept map[string]bool, keep bool) {
 			if name && !f.exempt.names[n.Name] {
 				n.Name = f.name(n.Name)
 			}
-			f.renameExpr(n.Value, on, kept)
+			f.renameExpr(n.Value, on, iters)
 		case *types.Block:
 			// A declaration exempt with its keys (by a .tfvars marker) keeps
 			// every name in it, as under a marker of its own.
 			_, deep := f.exempt.covers(declares(n))
 			deep = deep && pl.top
 			on = on && !deep
-			inner := kept
+			inner := iters
+			if n.Type == "dynamic" && len(n.Labels) > 0 {
+				// Its iterator: the label, which keeps its name where the
+				// label does, or the iterator argument's name.
+				inner = with(iters, !on || !f.renames("dynamic"), n.Labels[0])
+				for _, c := range n.Children {
+					if a, ok := c.(*types.Attribute); ok && a.Name == "iterator" {
+						if r, ok := a.Value.(*types.ReferenceExpr); ok && len(r.Parts) == 1 {
+							inner = with(inner, !on, r.Parts[0])
+						}
+					}
+				}
+			}
 			if on {
 				n.Type = f.name(n.Type)
 				// A declaration that a marker elsewhere exempts keeps its name.
@@ -124,17 +142,6 @@ func (f *formatter) renamePlan(pl *plan, kept map[string]bool, keep bool) {
 					labels := append([]string{}, n.Labels...)
 					labels[i] = f.name(labels[i])
 					n.Labels = labels
-				} else if !ok && n.Type == "dynamic" && len(n.Labels) > 0 {
-					inner = with(kept, n.Labels[0])
-				}
-			} else if n.Type == "dynamic" && len(n.Labels) > 0 {
-				inner = with(kept, n.Labels[0])
-				for _, c := range n.Children {
-					if a, ok := c.(*types.Attribute); ok && a.Name == "iterator" {
-						if r, ok := a.Value.(*types.ReferenceExpr); ok && len(r.Parts) == 1 {
-							inner = with(inner, r.Parts[0])
-						}
-					}
 				}
 			}
 			f.renamePlan(e.plan, inner, keep || deep)
@@ -167,16 +174,30 @@ func (f *formatter) exempted(p []string) bool {
 	return p != nil && n > 0
 }
 
-// with returns kept with more names.
-func with(kept map[string]bool, names ...string) map[string]bool {
+// with returns iters with more iterator names, which keep their names or
+// not.
+func with(iters map[string]bool, keep bool, names ...string) map[string]bool {
 	out := map[string]bool{}
-	for k := range kept {
-		out[k] = true
+	for k, v := range iters {
+		out[k] = v
 	}
 	for _, n := range names {
-		out[n] = true
+		if n != "" {
+			out[n] = keep
+		}
 	}
 	return out
+}
+
+// readName renames a name read through an iterator: each.value, a dynamic
+// block's iterator or a for-expression variable. The formatter cannot tell
+// which declaration such a read reaches, so a name some ignore_naming
+// marker keeps as a key keeps its dashes (D14).
+func (f *formatter) readName(s string) string {
+	if f.exempt.keys[s] {
+		return s
+	}
+	return f.name(s)
 }
 
 // rootRef returns the reference a chain of traversals, indexes and splats
@@ -199,21 +220,31 @@ func rootRef(e types.Expression) *types.ReferenceExpr {
 }
 
 // renameExpr renames, in e: every step of a reference (but the names an
-// exemption keeps, and those of references that start with a name in kept),
-// for-expression variables, and unquoted object keys. Quoted text is never
-// renamed. When on is false, the rule is off for e's item: its
-// for-expression variables (and so the references to them) and its object
-// keys stay.
-func (f *formatter) renameExpr(e types.Expression, on bool, kept map[string]bool) {
-	if !on {
-		walk(e, func(x types.Expression) {
-			switch x := x.(type) {
-			case *types.ForArrayExpr:
-				kept = with(kept, x.KeyVar, x.ValueVar)
-			case *types.ForMapExpr:
-				kept = with(kept, x.KeyVar, x.ValueVar)
-			}
-		})
+// exemption keeps, and the names read through an iterator that a marker
+// keeps as keys, see readName), for-expression variables, and unquoted object
+// keys. Quoted text is never renamed. When on is false, the rule is off for
+// e's item: its for-expression variables (and so the references to them)
+// and its object keys stay. iters holds the iterator names around e (see
+// renamePlan).
+func (f *formatter) renameExpr(e types.Expression, on bool, iters map[string]bool) {
+	walk(e, func(x types.Expression) {
+		switch x := x.(type) {
+		case *types.ForArrayExpr:
+			iters = with(iters, !on, x.KeyVar, x.ValueVar)
+		case *types.ForMapExpr:
+			iters = with(iters, !on, x.KeyVar, x.ValueVar)
+		}
+	})
+	// iter reports whether ref reads through an iterator (each.value counts
+	// as one), and whether its first part keeps its name.
+	iter := func(ref *types.ReferenceExpr) (keep, ok bool) {
+		if ref == nil {
+			return false, false
+		}
+		if keep, ok := iters[ref.Parts[0]]; ok {
+			return keep, true
+		}
+		return true, ref.Parts[0] == "each"
 	}
 	outputs := f.renames("output")
 	// renamed returns the names of ref that are renamed, parts[from:], and
@@ -226,7 +257,7 @@ func (f *formatter) renameExpr(e types.Expression, on bool, kept map[string]bool
 		switch {
 		case ref == nil:
 			return 0, false, true
-		case kept[ref.Parts[0]] || len(ref.Parts) == 1 && f.exempt.names[ref.Parts[0]]:
+		case len(ref.Parts) == 1 && f.exempt.names[ref.Parts[0]]:
 			return len(ref.Parts), false, false
 		}
 		n, deep := f.exempt.covers(ref.Parts)
@@ -236,6 +267,7 @@ func (f *formatter) renameExpr(e types.Expression, on bool, kept map[string]bool
 		return n, ref.Parts[0] == "module" && !outputs, true
 	}
 	first := map[types.Expression]bool{} // traversals whose first attribute step is an output's name
+	keys := map[types.Expression]bool{}  // traversals that read through an iterator
 	skip := map[types.Expression]bool{}
 	walk(e, func(x types.Expression) {
 		if skip[x] {
@@ -249,8 +281,19 @@ func (f *formatter) renameExpr(e types.Expression, on bool, kept map[string]bool
 				}
 			}
 		case *types.ReferenceExpr:
-			from, output, _ := renamed(x)
 			parts := append([]string{}, x.Parts...)
+			if keep, ok := iter(x); ok {
+				for i := range parts {
+					if i > 0 {
+						parts[i] = f.readName(parts[i])
+					} else if !keep {
+						parts[i] = f.name(parts[i])
+					}
+				}
+				x.Parts = parts
+				break
+			}
+			from, output, _ := renamed(x)
 			for i := from; i < len(parts); i++ {
 				if !output || i != 2 {
 					parts[i] = f.name(parts[i])
@@ -258,12 +301,20 @@ func (f *formatter) renameExpr(e types.Expression, on bool, kept map[string]bool
 			}
 			x.Parts = parts
 		case *types.RelativeTraversalExpr:
+			if _, ok := iter(rootRef(x.Source)); ok || keys[x] {
+				f.renameSteps(x.Traversal, false, f.readName)
+				break
+			}
 			_, output, steps := renamed(rootRef(x.Source))
 			first[x] = first[x] || output && !readsOutput(x.Source)
 			if steps {
-				f.renameSteps(x.Traversal, first[x])
+				f.renameSteps(x.Traversal, first[x], f.name)
 			}
 		case *types.SplatExpr:
+			if _, ok := iter(rootRef(x.Source)); ok {
+				walk(x.Each, func(y types.Expression) { keys[y] = true })
+				break
+			}
 			_, output, steps := renamed(rootRef(x.Source))
 			if !steps {
 				walk(x.Each, func(y types.Expression) { skip[y] = true })
@@ -282,13 +333,13 @@ func (f *formatter) renameExpr(e types.Expression, on bool, kept map[string]bool
 	})
 }
 
-// renameSteps renames the attribute steps of a traversal, but the first one
-// when keepFirst.
-func (f *formatter) renameSteps(steps []types.TraversalElem, keepFirst bool) {
+// renameSteps renames the attribute steps of a traversal with rename, but
+// the first one when keepFirst.
+func (f *formatter) renameSteps(steps []types.TraversalElem, keepFirst bool, rename func(string) string) {
 	for i := range steps {
 		if steps[i].Type == "attr" {
 			if !keepFirst {
-				steps[i].Name = f.name(steps[i].Name)
+				steps[i].Name = rename(steps[i].Name)
 			}
 			keepFirst = false
 		}
@@ -316,7 +367,7 @@ func readsOutput(e types.Expression) bool {
 // sortObjects sorts the keys of every object A-Z, ignoring case, in items
 // the rule is on for.
 func (f *formatter) sortObjects(top *plan) {
-	p := &printer{cfg: f.cfg, text: f.root.Text}
+	p := newPrinter(f.cfg, f.root.Text)
 	visit(top, func(e *entry, _ *plan) {
 		a, ok := e.node.(*types.Attribute)
 		if !ok || !f.on(e.off, config.RuleObjectKeys) {

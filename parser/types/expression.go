@@ -50,7 +50,7 @@ func (l *LiteralValue) Range() hcl.Range {
 type ObjectExpr struct {
 	ExprComments
 	Items       []ObjectItem
-	OpenComment string // The comments on the opening brace's line, after it, when the first item starts on a later line, one per line. When the object is the value of an item that starts on that line, the item holds the first one as its InlineComment instead; when the object is in that item's list or call value, the item holds the first one too (InlineInside)
+	OpenComment string // The comments on the opening brace's line, after it, when the first item starts on a later line, one per line. When the object is the whole value of an item that starts on that line, the item holds the first one as its InlineComment instead; when the object is anywhere else in that item's value (a list element, a call argument, a branch of a conditional, in parentheses), the item holds the first one too, with InlineInside set
 	EndComment  string // The comments after the last item (or the opening brace, when there is none), on their own lines, one per line
 	ExprRange   hcl.Range
 }
@@ -59,7 +59,7 @@ type ObjectItem struct {
 	Key           Expression
 	Value         Expression
 	InlineComment string // The first comment on the item's first line, after its start and before the next item or the closing brace
-	InlineInside  bool   // InlineComment is also held inside the value, which prints it: as the InlineComment of an object item there that starts on the same line, or, when it comes after the first element of a list or call value starts, as a comment of that list's or call's parts; it follows that item or part
+	InlineInside  bool   // InlineComment is also held inside the value, which prints it: as the InlineComment of an object item there that starts on the same line, or as a comment of the part of the value it belongs to by position, wherever in the value that part is: when the outermost list or call around it has an element that started before it, that element (or a part of it); when that is an object that is not the whole value, that object (D13). It follows that item or part
 	BlockComment  string // The comments on the lines between the previous item (or the opening brace) and this one, one per line
 	TrailComment  string // The comments after the item on its last line, besides InlineComment
 	ExprRange     hcl.Range

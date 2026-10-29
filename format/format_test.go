@@ -1536,3 +1536,409 @@ output "subnet-ids" {
 }
 `)
 }
+
+func TestRound4Comments(t *testing.T) {
+	// A comment keeps its owner when the output is parsed again (D13), so
+	// formatting twice changes nothing (check). An item's own comment ends
+	// the item's first line only where no argument or element has started
+	// and no object other than the value opens: the call it would follow
+	// goes one argument per line, the for expression around such an object
+	// breaks after its bracket, and otherwise the comment ends the value's
+	// last line (R4a-001, R4c-001). A comment after an element's start
+	// belongs to that element wherever its list sits (R4a-002).
+	check(t, nil, `variable "person" {
+  type = object({ name = string, age = number }) # the person to greet
+}
+
+resource "aws_instance" "web" {
+  tags      = merge(local.common_tags, { Name = "web" }) # web server tags
+  user_data = templatefile("${path.module}/init.sh", { port = 8080 }) # bootstrap script
+  zones     = toset(["us-east-1a", "us-east-1b", "us-east-1c", "us-east-1d", "us-east-1e", "us-east-1f"]) # all zones
+  extra = merge( # written broken
+    var.x,
+    { a = 1 },
+  )
+  ebs = map(/* nested */ object({
+    size = number
+  }))
+  cidr_blocks = var.office ? ["10.0.0.0/8", # corporate network
+    "192.168.0.0/16",                       # VPN users
+  ] : []
+  rules = var.enabled ? [{ # HTTPS from anywhere
+    port = 443
+    }, { # SSH
+    port = 22
+  }] : []
+  grouped = (["a", # first
+  "b"])
+  picked = [["a", # first
+  "b"]][0]
+  open     = var.on ? { # the object
+    a = 1
+  } : {}
+  either   = var.on ? { a = 1 } : {} # the whole value
+  subnets  = [for s in var.subnets : { id = s }] # one per subnet
+  members  = distinct(concat(var.members, var.on ? [] : var /* tail */ .more))
+}
+`, `resource "aws_instance" "web" {
+  cidr_blocks = var.office ? [
+    "10.0.0.0/8",     # corporate network
+    "192.168.0.0/16", # VPN users
+  ] : []
+
+  ebs = map( # nested
+    object({
+      size = number
+    }),
+  )
+
+  either = var.on ? {
+    a = 1
+  } : {} # the whole value
+
+  extra = merge( # written broken
+    var.x,
+    {
+      a = 1
+    },
+  )
+
+  grouped = ([
+    "a", # first
+    "b",
+  ])
+
+  members = distinct(concat(
+    var.members,
+    var.on ? [] : var.more, # tail
+  ))
+
+  open = var.on ? { # the object
+    a = 1
+  } : {}
+
+  picked = [
+    [
+      "a", # first
+      "b",
+    ],
+  ][0]
+
+  rules = var.enabled ? [
+    { # HTTPS from anywhere
+      port = 443
+    },
+    { # SSH
+      port = 22
+    },
+  ] : []
+
+  subnets = [ # one per subnet
+    for s in var.subnets : {
+      id = s
+    }
+  ]
+
+  user_data = templatefile( # bootstrap script
+    "${path.module}/init.sh",
+    {
+      port = 8080
+    },
+  )
+
+  zones = toset( # all zones
+    [
+      "us-east-1a",
+      "us-east-1b",
+      "us-east-1c",
+      "us-east-1d",
+      "us-east-1e",
+      "us-east-1f",
+    ],
+  )
+
+  tags = merge( # web server tags
+    local.common_tags,
+    {
+      Name = "web"
+    },
+  )
+}
+
+variable "person" {
+  type = object( # the person to greet
+    {
+      age  = number
+      name = string
+    },
+  )
+}
+`)
+	// The same for an object item, here in a .tfvars file.
+	files := map[string]string{"terraform.tfvars": `sites = {
+  web = merge(local.defaults, { port = 80 }) # public site
+}
+policy = jsonencode({ Version = "2012-10-17" }) # minimal policy
+`}
+	want := `policy = jsonencode( # minimal policy
+  {
+    Version = "2012-10-17"
+  },
+)
+
+sites = {
+  web = merge( # public site
+    local.defaults,
+    {
+      port = 80
+    },
+  )
+}
+`
+	if got := formatSource(t, config.Default(), "terraform.tfvars", files); got != want {
+		t.Errorf("terraform.tfvars:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestRound4Naming(t *testing.T) {
+	// A name read through each.value, a dynamic block's iterator or a
+	// for-expression variable keeps its dashes exactly when an ignore_naming
+	// marker in the directory keeps a key of that name (D14): here the
+	// marked variable's keys (R4b-001).
+	check(t, nil, `# terralint ignore_naming
+variable "ingress-rules" {
+  type = list(object({
+    from-port = number
+  }))
+}
+
+resource "aws_security_group" "api" {
+  dynamic "ingress" {
+    for_each = var.ingress-rules
+    content {
+      from_port = ingress.value.from-port
+    }
+  }
+}
+
+resource "terraform_data" "each" {
+  for_each = { for i, r in var.ingress-rules : i => r }
+  input    = each.value.from-port
+}
+
+output "ports" {
+  value = [for r in var.ingress-rules : r.from-port]
+}
+`, `output "ports" {
+  value = [for r in var.ingress-rules : r.from-port]
+}
+
+resource "aws_security_group" "api" {
+  dynamic "ingress" {
+    for_each = var.ingress-rules
+
+    content {
+      from_port = ingress.value.from-port
+    }
+  }
+}
+
+resource "terraform_data" "each" {
+  for_each = { for i, r in var.ingress-rules : i => r }
+
+  input = each.value.from-port
+}
+
+# terralint ignore_naming
+variable "ingress-rules" {
+  type = list(object({
+    from-port = number
+  }))
+}
+`)
+	// A marked locals entry and a marked .tfvars assignment keep their keys
+	// for such reads too.
+	files := map[string]string{
+		"main.tf": `locals {
+  # terralint ignore_naming
+  subnet-map = { us-east-1a = { cidr-block = "10.0.1.0/24" } }
+}
+
+resource "aws_subnet" "s" {
+  for_each   = local.subnet-map
+  cidr_block = each.value.cidr-block
+  name       = each.value.zone-name
+}
+
+output "ports" {
+  value = [for r in var.rules : r.to-port]
+}
+`,
+		"terraform.tfvars": `# terralint ignore_naming
+rules = [{ to-port = 443 }]
+`,
+	}
+	want := `locals {
+  # terralint ignore_naming
+  subnet-map = {
+    us-east-1a = {
+      cidr-block = "10.0.1.0/24"
+    }
+  }
+}
+
+output "ports" {
+  value = [for r in var.rules : r.to-port]
+}
+
+resource "aws_subnet" "s" {
+  for_each = local.subnet-map
+
+  cidr_block = each.value.cidr-block
+  name       = each.value.zone_name
+}
+`
+	if got := formatSource(t, config.Default(), "main.tf", files); got != want {
+		t.Errorf("main.tf:\n%s\nwant:\n%s", got, want)
+	}
+
+	// Inside an item under ignore_naming, such reads of a renamed
+	// variable's keys are renamed too, as they are when "dynamic" is left
+	// out of Naming.Labels (R4b-002).
+	src := `variable "sg-rules" {
+  type = list(object({
+    from-port = number
+  }))
+}
+
+# terralint ignore_naming
+resource "aws_security_group" "web-sg" {
+  description = join(",", [for my-r in var.sg-rules : my-r.from-port])
+
+  dynamic "my-ingress" {
+    for_each = var.sg-rules
+
+    content {
+      from_port = my-ingress.value.from-port
+    }
+  }
+}
+`
+	check(t, nil, src, `# terralint ignore_naming
+resource "aws_security_group" "web-sg" {
+  description = join(",", [for my-r in var.sg_rules : my-r.from_port])
+
+  dynamic "my-ingress" {
+    for_each = var.sg_rules
+
+    content {
+      from_port = my-ingress.value.from_port
+    }
+  }
+}
+
+variable "sg_rules" {
+  type = list(object({
+    from_port = number
+  }))
+}
+`)
+	cfg := config.Default()
+	delete(cfg.Naming.Labels, "dynamic")
+	check(t, cfg, strings.Replace(src, "# terralint ignore_naming\n", "", 1), `resource "aws_security_group" "web_sg" {
+  description = join(",", [for my_r in var.sg_rules : my_r.from_port])
+
+  dynamic "my-ingress" {
+    for_each = var.sg_rules
+
+    content {
+      from_port = my-ingress.value.from_port
+    }
+  }
+}
+
+variable "sg_rules" {
+  type = list(object({
+    from_port = number
+  }))
+}
+`)
+}
+
+func TestRound4Sections(t *testing.T) {
+	// Nested blocks of one type keep their source order across a section
+	// that holds some of them, whatever its anchor sorts to (D15, R4b-003):
+	// the section follows the last block of that type before it, or else
+	// goes right before the first one after it.
+	check(t, nil, `resource "null_resource" "setup" {
+  provisioner "local-exec" {
+    command = "step-1"
+  }
+
+  connection {
+    host = "x"
+  }
+
+  # terralint remote steps {
+  provisioner "remote-exec" {
+    inline = ["step-2"]
+  }
+  # }
+
+  provisioner "local-exec" {
+    command = "step-3"
+  }
+}
+
+resource "aws_cloudfront_distribution" "cdn" {
+  depends_on = [aws_s3_bucket.b]
+
+  # terralint static assets {
+  ordered_cache_behavior {
+    path_pattern = "/static/*"
+  }
+  # }
+
+  enabled = true
+
+  ordered_cache_behavior {
+    path_pattern = "/*"
+  }
+}
+`, `resource "aws_cloudfront_distribution" "cdn" {
+  enabled = true
+
+  # terralint static assets {
+  ordered_cache_behavior {
+    path_pattern = "/static/*"
+  }
+  # }
+
+  ordered_cache_behavior {
+    path_pattern = "/*"
+  }
+
+  depends_on = [aws_s3_bucket.b]
+}
+
+resource "null_resource" "setup" {
+  connection {
+    host = "x"
+  }
+
+  provisioner "local-exec" {
+    command = "step-1"
+  }
+
+  # terralint remote steps {
+  provisioner "remote-exec" {
+    inline = ["step-2"]
+  }
+  # }
+
+  provisioner "local-exec" {
+    command = "step-3"
+  }
+}
+`)
+}
