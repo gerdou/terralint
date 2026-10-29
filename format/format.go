@@ -77,7 +77,7 @@ func (f *formatter) renames(blockType string) bool {
 // ephemeral.<type>.x, output.x), each true when the naming rule renames it.
 type names struct {
 	renamed map[string]bool
-	whole   map[string]bool   // var.x that an ignore_naming marker keeps with all its names: its declaration and every .tfvars value
+	whole   map[string]bool   // var.x that an ignore_naming marker keeps with all its names: its declaration and every .tfvars value in its own directory (not var files elsewhere)
 	sources map[string]string // module call label -> source, for local child modules
 }
 

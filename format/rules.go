@@ -86,7 +86,10 @@ func (f *formatter) name(s string) string {
 // local child module. A data source declared in a check block is scoped to
 // it: references to it there follow it (D24). Items under ignore_naming keep
 // their own names; a marker on a variable or on a .tfvars assignment of it
-// keeps every name of both. A module call's arguments name the child's
+// in the variable's own directory keeps every name of both. A .tfvars file
+// in another directory (a -var-file such as envs/prod.tfvars) is not read,
+// so it is not paired: mark the variable and each assignment of it there
+// (limitation). A module call's arguments name the child's
 // variables: one that a local child declares follows that variable, whatever
 // markers the call carries, and keeps its keys when the variable is marked;
 // others are ordinary names (D23). With the rule off in config, nothing is
