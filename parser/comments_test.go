@@ -332,9 +332,12 @@ func TestInlineOwner(t *testing.T) {
 // line, belongs to that list or call (D13), not to its first element: it is
 // its OpenComment, on any line. A second comment on that line is the first
 // element's; an empty list ends with it. In a list or call that is no
-// element of one, such a comment is the item's on the item's first line
-// (where it is when printed there) and the first element's on other lines,
-// as before (R6c-001).
+// element or argument of one, such a comment is the item's on the item's
+// first line when no element of the value has started before it (D13), and
+// otherwise the first element's LeadComment (R6c-001), also when the list
+// or call is a conditional branch, an operand, in parentheses or under an
+// index inside an element or argument (D17, a recorded limitation; see
+// TestRound7Comments in package format).
 func TestOpenCommentOwner(t *testing.T) {
 	for _, c := range []struct{ value, want string }{
 		{"toset([ # c\n  \"a\"])", "OpenComment"},

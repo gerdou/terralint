@@ -78,11 +78,12 @@ func (f *formatter) name(s string) string {
 
 // rename applies the naming rule: to attribute names, block types, the
 // labels that name things, and everything in expressions that is a name
-// (see renameExpr). Items the rule is off for keep their own names, but
-// their references to names declared elsewhere are renamed, so that they
-// still match.
+// (see renameExpr). A reference is renamed exactly when the declaration it
+// names is (D18): items a marker turns the rule off for keep their own
+// names, but their references to names declared elsewhere are renamed, so
+// that they still match. With the rule off in config, nothing is renamed.
 func (f *formatter) rename(top *plan) {
-	if f.cfg.Naming.Replace == "" {
+	if f.cfg.Naming.Replace == "" || !f.cfg.On(config.RuleNaming) {
 		return
 	}
 	f.renamePlan(top, nil, false)

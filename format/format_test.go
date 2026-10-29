@@ -6,13 +6,17 @@ package format_test
 // which must change nothing.
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/gerdou/terralint/config"
 	"github.com/gerdou/terralint/format"
+	"github.com/gerdou/terralint/parser"
 )
 
 // formatSource writes files (name -> content) to a new directory and
@@ -571,6 +575,7 @@ func TestConfigSwitches(t *testing.T) {
 
 locals {
   c = 1
+  d = local.b-x
 }
 `
 	check(t, cfg, src, src)
@@ -2243,5 +2248,294 @@ variable "node-pools" {
 `
 	if got := formatSource(t, config.Default(), "main.tf", files); got != want {
 		t.Errorf("main.tf:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestRound7Naming(t *testing.T) {
+	// A reference is renamed exactly when the declaration it names is
+	// (D18): with the naming rule off in config nothing is renamed, the
+	// references to dashed declarations in other files, and reads through
+	// iterators, included (R7b-001).
+	cfg := config.Default()
+	cfg.Rules[config.RuleNaming] = false
+	files := map[string]string{
+		"main.tf": `variable "my-x" {
+  type = object({
+    log-level = string
+  })
+}
+
+locals {
+  my-local = var.my-x.log-level
+  keys     = [for my-v in var.my-list : my-v.my-key]
+}
+
+resource "aws_s3_bucket" "my-bucket" {
+  for_each = var.my-map
+  bucket   = local.my-local
+  name     = each.value.my-key
+  tags = {
+    my-tag = var.my-x.log-level
+  }
+  dynamic "my-rule" {
+    for_each = var.my-list
+    content {
+      port = my-rule.value.from-port
+    }
+  }
+}
+
+module "gcp-network" {
+  source = "./net"
+}
+`,
+		"outputs.tf": `output "bucket-id" {
+  value = aws_s3_bucket.my-bucket["a"].id
+}
+
+output "network" {
+  value = module.gcp-network.network-self-link
+}
+`,
+	}
+	want := map[string]string{
+		"main.tf": `locals {
+  keys     = [for my-v in var.my-list : my-v.my-key]
+  my-local = var.my-x.log-level
+}
+
+module "gcp-network" {
+  source = "./net"
+}
+
+resource "aws_s3_bucket" "my-bucket" {
+  for_each = var.my-map
+
+  bucket = local.my-local
+  name   = each.value.my-key
+
+  dynamic "my-rule" {
+    for_each = var.my-list
+
+    content {
+      port = my-rule.value.from-port
+    }
+  }
+
+  tags = {
+    my-tag = var.my-x.log-level
+  }
+}
+
+variable "my-x" {
+  type = object({
+    log-level = string
+  })
+}
+`,
+		"outputs.tf": `output "bucket-id" {
+  value = aws_s3_bucket.my-bucket["a"].id
+}
+
+output "network" {
+  value = module.gcp-network.network-self-link
+}
+`,
+	}
+	for name := range want {
+		if got := formatSource(t, cfg, name, files); got != want[name] {
+			t.Errorf("%s:\n%s\nwant:\n%s", name, got, want[name])
+		}
+	}
+}
+
+// heldAt returns the field of src's AST that holds the comment line text,
+// as a path from the value of the attribute it is in ("Value.Args[0]...");
+// an InlineComment that InlineInside says the value holds too is skipped.
+func heldAt(t *testing.T, src, text string) string {
+	t.Helper()
+	root, err := parser.Parse([]byte(src), "main.tf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var find func(v reflect.Value, at string) string
+	find = func(v reflect.Value, at string) string {
+		switch v.Kind() {
+		case reflect.Interface, reflect.Ptr:
+			if !v.IsNil() {
+				return find(v.Elem(), at)
+			}
+		case reflect.Struct:
+			for i := 0; i < v.NumField(); i++ {
+				f := v.Type().Field(i)
+				switch {
+				case !f.IsExported():
+				case f.Type.Kind() == reflect.String && strings.HasSuffix(f.Name, "Comment"):
+					if in := v.FieldByName("InlineInside"); f.Name == "InlineComment" && in.IsValid() && in.Bool() {
+						continue
+					}
+					if slices.Contains(strings.Split(v.Field(i).String(), "\n"), text) {
+						return at + "." + f.Name
+					}
+				default:
+					if h := find(v.Field(i), at+"."+f.Name); h != "" {
+						return h
+					}
+				}
+			}
+		case reflect.Slice:
+			for i := 0; i < v.Len(); i++ {
+				if h := find(v.Index(i), fmt.Sprintf("%s[%d]", at, i)); h != "" {
+					return h
+				}
+			}
+		}
+		return ""
+	}
+	at := find(reflect.ValueOf(root), "")
+	if i := strings.Index(at, ".Value."); i >= 0 {
+		return at[i+1:]
+	}
+	return at
+}
+
+func TestRound7Comments(t *testing.T) {
+	// A comment after the opening bracket of a list or call that is a
+	// conditional branch, an operand, in parentheses or under an index
+	// inside a call argument or list element is held by the list's or
+	// call's first element, and printed on its own line just inside the
+	// bracket, merged with that element's own comment (D17, a recorded
+	// limitation; R7a-001, R7c-001). It is kept, the output holds it where
+	// the source does, and the second run changes nothing.
+	src := `output "forwarding_rules" {
+  value = concat(
+    local.create_http ? [ # HTTP forwarding rule
+      # primary
+      google_compute_global_forwarding_rule.http[0].self_link,
+    ] : [],
+    var.ssl ? [ # HTTPS forwarding rule
+      google_compute_global_forwarding_rule.https[0].self_link,
+    ] : [],
+  )
+}
+
+locals {
+  zones = concat(var.multi_az ? [ # all zones in the region
+    "a",
+    "b",
+  ] : ["a"], var.extra)
+  ports = [
+    80,
+    var.tls ? [ # https only
+      443,
+    ] : [],
+  ]
+  first = element([ # candidates
+    "a",
+    "b",
+  ][0], 0)
+  parens = concat(([ # in parens
+    "x",
+  ]), var.b)
+  subnets = concat(
+    var.public ? tolist( # public subnets
+      var.public_subnets
+    ) : [],
+    var.b,
+  )
+  same = f(
+    var.a == [ # operand
+      "a",
+    ],
+    var.b,
+  )
+}
+`
+	want := `locals {
+  first = element(
+    [
+      # candidates
+      "a",
+      "b",
+    ][0],
+    0,
+  )
+
+  parens = concat(
+    ([
+      # in parens
+      "x",
+    ]),
+    var.b,
+  )
+
+  ports = [
+    80,
+    var.tls ? [
+      # https only
+      443,
+    ] : [],
+  ]
+
+  same = f(
+    var.a == [
+      # operand
+      "a",
+    ],
+    var.b,
+  )
+
+  subnets = concat(
+    var.public ? tolist(
+      # public subnets
+      var.public_subnets,
+    ) : [],
+    var.b,
+  )
+
+  zones = concat(
+    var.multi_az ? [
+      # all zones in the region
+      "a",
+      "b",
+    ] : ["a"],
+    var.extra,
+  )
+}
+
+output "forwarding_rules" {
+  value = concat(
+    local.create_http ? [
+      # HTTP forwarding rule
+      # primary
+      google_compute_global_forwarding_rule.http[0].self_link,
+    ] : [],
+    var.ssl ? [
+      # HTTPS forwarding rule
+      google_compute_global_forwarding_rule.https[0].self_link,
+    ] : [],
+  )
+}
+`
+	got := formatSource(t, config.Default(), "main.tf", map[string]string{"main.tf": src})
+	if got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+	for label, at := range map[string]string{
+		"HTTP forwarding rule":    "Value.Args[0].TrueExpr.Items[0].ExprComments.LeadComment",
+		"primary":                 "Value.Args[0].TrueExpr.Items[0].ExprComments.LeadComment",
+		"HTTPS forwarding rule":   "Value.Args[1].TrueExpr.Items[0].ExprComments.LeadComment",
+		"all zones in the region": "Value.Args[0].TrueExpr.Items[0].ExprComments.LeadComment",
+		"https only":              "Value.Items[1].TrueExpr.Items[0].ExprComments.LeadComment",
+		"candidates":              "Value.Args[0].Source.Items[0].ExprComments.LeadComment",
+		"in parens":               "Value.Args[0].Expression.Items[0].ExprComments.LeadComment",
+		"public subnets":          "Value.Args[0].TrueExpr.Args[0].ExprComments.LeadComment",
+		"operand":                 "Value.Args[0].Right.Items[0].ExprComments.LeadComment",
+	} {
+		for what, text := range map[string]string{"source": src, "output": got} {
+			if h := heldAt(t, text, label); h != at {
+				t.Errorf("%q in the %s: held at %s, want %s", label, what, h, at)
+			}
+		}
 	}
 }

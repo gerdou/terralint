@@ -450,9 +450,13 @@ func (c *converter) attach(e types.Expression, cs []int) {
 // an element or argument of parent, when both are lists or calls and i is
 // the first comment after e's opening bracket on its line, ends on that
 // line, and comes before e's first part on a later line: D13 gives it to e,
-// not to that part. Else nil. (In a list or call that is not an element of
-// one, such a comment is the item's on the item's first line, see inValue,
-// and leads the first part on other lines.)
+// not to that part. Else nil. (In a list or call that is not an element or
+// argument of one, such a comment is the item's when inValue leaves it to
+// the item: on the item's first line, before any element of the value has
+// started. Otherwise it leads the first part, which prints it just inside
+// the bracket, also when the list or call sits in a conditional branch, an
+// operand, parentheses or an index inside an element or argument: D17, a
+// recorded limitation.)
 func (c *converter) openComment(parent, e types.Expression, i int) *string {
 	var open *string
 	switch e := e.(type) {

@@ -8,7 +8,7 @@ const (
 	RuleOrdering   = "ordering"    // Body items in priority, then A-Z, order
 	RuleObjectKeys = "object_keys" // Object keys A-Z
 	RuleObjects    = "objects"     // Objects with items one item per line (off: as written, one line or not)
-	RuleNaming     = "naming"      // '-' becomes '_' in names
+	RuleNaming     = "naming"      // '-' becomes '_' in names (off here: no name changes, references included)
 	RuleComments   = "comments"    // Comments become # comments, one per line
 	RuleLocals     = "locals"      // A file's locals blocks merge into one
 	RuleLists      = "lists"       // Short lists on one line, others one element per line
