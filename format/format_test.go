@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gerdou/terralint/config"
 	"github.com/gerdou/terralint/format"
@@ -1791,5 +1792,259 @@ module "m" {
 	}
 	if got := formatSource(t, noVar, "a.tfvars", map[string]string{"main.tf": "variable \"my-x\" {}\n", "a.tfvars": "my-x = 1\n"}); got != "my-x = 1\n" {
 		t.Errorf("without variable labels, a.tfvars: %q", got)
+	}
+}
+
+func TestCheckScopedData(t *testing.T) {
+	// A data source declared in a check block is scoped to it: references
+	// to it in the check follow its rename and its marker (D24).
+	src := `check "site-up" {
+  data "http" "my-site" {
+    url = "https://example.com"
+  }
+
+  assert {
+    condition     = data.http.my-site.status_code == 200
+    error_message = "down"
+  }
+}
+
+check "kept" {
+  # terralint ignore_naming
+  data "http" "keep-site" {
+    url = "https://example.com"
+  }
+
+  assert {
+    condition     = data.http.keep-site.status_code == 200 && data.http.my-other.id != ""
+    error_message = "down"
+  }
+}
+
+data "http" "my-other" {}
+`
+	check(t, nil, src, `check "kept" {
+  assert {
+    condition     = data.http.keep-site.status_code == 200 && data.http.my_other.id != ""
+    error_message = "down"
+  }
+
+  # terralint ignore_naming
+  data "http" "keep-site" {
+    url = "https://example.com"
+  }
+}
+
+check "site-up" {
+  assert {
+    condition     = data.http.my_site.status_code == 200
+    error_message = "down"
+  }
+
+  data "http" "my_site" {
+    url = "https://example.com"
+  }
+}
+
+data "http" "my_other" {}
+`)
+	noData := config.Default()
+	delete(noData.Naming.Labels, "data")
+	if got := formatSource(t, noData, "main.tf", map[string]string{"main.tf": src}); !strings.Contains(got, `data "http" "my-site"`) || !strings.Contains(got, "data.http.my-site.status_code") {
+		t.Errorf("without data labels, the scoped data source and its reference keep their names:\n%s", got)
+	}
+}
+
+func TestModuleCallArguments(t *testing.T) {
+	// An argument a local child module declares follows the child's
+	// variable, whatever markers the call carries; its keys are kept when
+	// the child's variable is marked. Other arguments are ordinary names: a
+	// marker on the call, a section around it or on the argument keeps them
+	// and their keys (D23). Output reads follow the child also when the call
+	// is in a file without a dash.
+	files := map[string]string{
+		"main.tf": `# terralint ignore_naming
+module "reg" {
+  source      = "Azure/naming/azurerm"
+  unique-seed = "abc"
+  name-prefix = { my-key = 1 }
+}
+
+# terralint ignore_naming {
+module "reg-two" {
+  source      = "cloudposse/label/null"
+  label-order = ["a"]
+}
+# }
+
+# terralint ignore_naming
+module "net" {
+  source     = "./modules/net"
+  cidr-block = "10.0.0.0/16"
+  vpc-name   = "x"
+  tag-map    = { my-key = 1 }
+  opts       = { my-key = 1 }
+  extra-arg  = { my-key = 1 }
+}
+
+module "net-two" {
+  source     = "./modules/net"
+  cidr-block = "10.0.0.0/16"
+  vpc-name   = "x"
+  tag-map    = { my-key = 1 }
+  opts       = { my-key = 1 }
+  # terralint ignore_naming
+  extra-arg  = { my-key = 1 }
+}
+
+output "ids" {
+  value = [module.net.vpc-id, module.lone.vpc-id]
+}
+`,
+		"calls.tf": "module \"lone\" {\n  source = \"./modules/net\"\n}\n",
+		"modules/net/variables.tf": `# terralint ignore_naming
+variable "cidr-block" {}
+
+variable "vpc-name" {}
+
+# terralint ignore_naming
+variable "tag-map" {}
+
+variable "opts" {}
+
+output "vpc-id" {
+  value = var.vpc-name
+}
+`,
+	}
+	want := `# terralint ignore_naming
+module "net" {
+  source = "./modules/net"
+
+  cidr-block = "10.0.0.0/16"
+
+  extra-arg = {
+    my-key = 1
+  }
+
+  opts = {
+    my-key = 1
+  }
+
+  tag-map = {
+    my-key = 1
+  }
+
+  vpc_name = "x"
+}
+
+module "net_two" {
+  source = "./modules/net"
+
+  cidr-block = "10.0.0.0/16"
+
+  # terralint ignore_naming
+  extra-arg = {
+    my-key = 1
+  }
+
+  opts = {
+    my_key = 1
+  }
+
+  tag-map = {
+    my-key = 1
+  }
+
+  vpc_name = "x"
+}
+
+# terralint ignore_naming
+module "reg" {
+  source = "Azure/naming/azurerm"
+
+  name-prefix = {
+    my-key = 1
+  }
+
+  unique-seed = "abc"
+}
+
+# terralint ignore_naming {
+module "reg-two" {
+  source = "cloudposse/label/null"
+
+  label-order = ["a"]
+}
+# }
+
+output "ids" {
+  value = [module.net.vpc_id, module.lone.vpc_id]
+}
+`
+	if got := formatSource(t, config.Default(), "main.tf", files); got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestSiblingChanges(t *testing.T) {
+	// What other files declare is read again when they change, also in the
+	// same process.
+	dir := t.TempDir()
+	write := func(name, content string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("main.tf", "output \"o\" {\n  value = var.my-x\n}\n")
+	for _, c := range []struct{ vars, want string }{
+		{"variable \"my-x\" {}\n", "var.my_x"},
+		{"# terralint ignore_naming\nvariable \"my-x\" {}\n", "var.my-x"},
+		{"variable \"my-x\" {}\n", "var.my_x"},
+	} {
+		write("vars.tf", c.vars)
+		out, err := format.File(filepath.Join(dir, "main.tf"), config.Default())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(out), c.want) {
+			t.Errorf("with vars.tf %q: want %s in:\n%s", c.vars, c.want, out)
+		}
+	}
+}
+
+func TestDirectoryCost(t *testing.T) {
+	// Formatting every file of a directory costs about what formatting each
+	// alone does, not the directory once per file (R9a-001): 60 files of 150
+	// resources with dashed names took 14s when each file parsed all others.
+	dir := t.TempDir()
+	var files []string
+	for f := 1; f <= 60; f++ {
+		var b strings.Builder
+		for r := 1; r <= 150; r++ {
+			fmt.Fprintf(&b, "resource \"aws_instance\" \"web-%d-%d\" {\n  ami       = var.ami-id\n  subnet_id = aws_subnet.main-%d.id\n  vpc       = module.vpc.private_subnets[0]\n  tags      = { Name = \"web-%d-%d\" }\n}\n\n", f, r, f, f, r)
+		}
+		fmt.Fprintf(&b, "resource \"aws_subnet\" \"main-%d\" {}\n", f)
+		files = append(files, filepath.Join(dir, fmt.Sprintf("f%d.tf", f)))
+		if err := os.WriteFile(files[len(files)-1], []byte(b.String()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	vars := "variable \"ami-id\" {}\n\nmodule \"vpc\" {\n  source = \"terraform-aws-modules/vpc/aws\"\n}\n"
+	if err := os.WriteFile(filepath.Join(dir, "vars.tf"), []byte(vars), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	for _, path := range files {
+		out, err := format.File(path, config.Default())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(out), "ami       = var.ami_id") {
+			t.Fatalf("%s: references do not follow the renamed variable:\n%.300s", path, out)
+		}
+	}
+	if took := time.Since(start); took > 8*time.Second {
+		t.Errorf("formatting a directory of 60 files took %s, want under 8s", took)
 	}
 }

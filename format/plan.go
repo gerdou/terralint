@@ -321,19 +321,7 @@ func (f *formatter) planBody(children []types.Body, end string, off offSet, bloc
 		}
 		e := &entry{node: child, lead: pending, off: base.with(itemOff)}
 		if b, ok := child.(*types.Block); ok {
-			inner := e.off
-			if depth == 0 && b.Type == "module" && inner[config.RuleNaming] {
-				// A module call's arguments name the child module's
-				// variables, so ignore_naming on the call keeps only the
-				// call's own name; its body follows the child's names.
-				inner = offSet{}
-				for r := range e.off {
-					if r != config.RuleNaming {
-						inner[r] = true
-					}
-				}
-			}
-			e.plan = f.planBody(b.Children, b.EndComment, inner, b.Type, depth+1, 0)
+			e.plan = f.planBody(b.Children, b.EndComment, e.off, b.Type, depth+1, 0)
 		}
 		if cur != nil {
 			cur.entries = append(cur.entries, e)

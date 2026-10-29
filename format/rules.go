@@ -83,9 +83,14 @@ func (f *formatter) name(s string) string {
 // the directory declares and the rule renames, which follows it (D18):
 // var.<name>, local.<name>, module.<name>, <type>.<name>,
 // data.<type>.<name>, ephemeral.<type>.<name>, and an output read from a
-// local child module. Items under ignore_naming keep their own names; a
-// marker on a variable or on a .tfvars assignment of it keeps every name of
-// both. With the rule off in config, nothing is renamed.
+// local child module. A data source declared in a check block is scoped to
+// it: references to it there follow it (D24). Items under ignore_naming keep
+// their own names; a marker on a variable or on a .tfvars assignment of it
+// keeps every name of both. A module call's arguments name the child's
+// variables: one that a local child declares follows that variable, whatever
+// markers the call carries, and keeps its keys when the variable is marked;
+// others are ordinary names (D23). With the rule off in config, nothing is
+// renamed.
 func (f *formatter) rename(top *plan) {
 	if f.cfg.Naming.Replace == "" || !f.cfg.On(config.RuleNaming) {
 		return
@@ -110,23 +115,38 @@ func (f *formatter) renamePlan(pl *plan, keep bool) {
 			// The assignments of a .tfvars file and the arguments of a module
 			// call are named after variables, and keep the names those keep.
 			tfvars := f.tfvars && pl.top
+			arg := pl.blockType == "module" && pl.depth == 1
 			if tfvars && f.dashed(n.Name) && f.decl().whole["var."+n.Name] {
 				on = false
 			}
-			name := on
-			if tfvars || pl.blockType == "module" && pl.depth == 1 {
+			name, keys := on, on
+			if tfvars || arg {
 				name = on && f.renames("variable") && !(tfvars && f.dashed(n.Name) && f.decl().kept("var."+n.Name))
+			}
+			if v := "var." + n.Name; arg && f.callee != nil {
+				// D23: an argument the local child declares follows the
+				// child's variable, whatever markers the call carries.
+				if _, ok := f.callee.renamed[v]; ok && f.dashed(n.Name) {
+					name = f.callee.renames(v)
+				}
+				keys = keys && !f.callee.whole[v]
 			}
 			if name {
 				n.Name = f.name(n.Name)
 			}
-			if on {
+			if keys {
 				f.renameKeys(n.Value)
 			}
 			f.renameRefs(n.Value)
 		case *types.Block:
 			if pl.top && n.Type == "variable" && len(n.Labels) > 0 && f.dashed(n.Labels[0]) && f.decl().whole["var."+n.Labels[0]] {
 				on = false
+			}
+			if pl.top {
+				f.scope, f.callee = f.checkScope(n, e.plan), nil
+				if n.Type == "module" && localSource(source(n)) {
+					f.callee = f.child(source(n))
+				}
 			}
 			if on {
 				n.Type = f.name(n.Type)
@@ -137,8 +157,29 @@ func (f *formatter) renamePlan(pl *plan, keep bool) {
 				}
 			}
 			f.renamePlan(e.plan, keep || !on && n.Type == "variable")
+			if pl.top {
+				f.scope, f.callee = nil, nil
+			}
 		}
 	}
+}
+
+// checkScope returns, for a check block, the data sources declared in it by
+// the start of the references to them, each true when it is renamed: they
+// are scoped to the check (D24). Else nil.
+func (f *formatter) checkScope(b *types.Block, pl *plan) map[string]bool {
+	if b.Type != "check" {
+		return nil
+	}
+	scope := map[string]bool{}
+	for _, e := range pl.all() {
+		if d, ok := e.node.(*types.Block); ok && d.Type == "data" {
+			if key := declKey(d); key != "" {
+				scope[key] = f.on(e.off, config.RuleNaming) && f.renames("data")
+			}
+		}
+	}
+	return scope
 }
 
 // providerPlace reports whether a body item holds only provider local
@@ -210,7 +251,7 @@ func (f *formatter) renameRefs(e types.Expression) {
 func (f *formatter) refParts(parts []string) []string {
 	p := append([]string{}, parts...)
 	at := func(i int) {
-		if i < len(p) && f.dashed(p[i]) && f.decl().renames(strings.Join(parts[:i+1], ".")) {
+		if i < len(p) && f.dashed(p[i]) && f.renamesRef(strings.Join(parts[:i+1], ".")) {
 			p[i] = f.name(p[i])
 		}
 	}
@@ -229,6 +270,16 @@ func (f *formatter) refParts(parts []string) []string {
 		at(1)
 	}
 	return p
+}
+
+// renamesRef reports whether the declaration the references starting with
+// key name is renamed: a data source of the check block being renamed
+// (D24), else one the directory declares.
+func (f *formatter) renamesRef(key string) bool {
+	if r, ok := f.scope[key]; ok {
+		return r
+	}
+	return f.decl().renames(key)
 }
 
 // moduleCall returns <name> when e is module.<name>, indexed or not.

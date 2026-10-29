@@ -9,9 +9,12 @@ package format
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/gerdou/terralint/config"
 	"github.com/gerdou/terralint/parser"
@@ -50,7 +53,11 @@ type formatter struct {
 	header   []string // the file header the printer puts first, as planFile found it
 	names    *names   // the names the file's directory declares (see decl)
 	sibsRead bool
-	children map[string]*names // by directory, for local child modules (see childRenames)
+	children map[string]*names // by directory, for local child modules (see child)
+	cfgKey   string            // cfg as text, for fileCache
+	want     map[string]bool   // the file's dashed words (see lookups)
+	scope    map[string]bool   // while renaming a check block: its data sources, renamed or not (D24)
+	callee   *names            // while renaming a call of a local child module: the child's names (D23)
 }
 
 // on reports whether rule applies under the rules turned off in off.
@@ -116,7 +123,7 @@ func (n *names) collect(f *formatter, top *plan) {
 				n.whole[key] = true
 			}
 			if x.Type == "module" {
-				if src := source(x); strings.HasPrefix(src, "./") || strings.HasPrefix(src, "../") {
+				if src := source(x); localSource(src) {
 					n.sources[x.Labels[0]] = src
 				}
 			}
@@ -155,7 +162,8 @@ func source(b *types.Block) string {
 }
 
 // dirNames collects the names the .tf and .tfvars files of dir declare, but
-// skip's (already collected), from files that hold a dash and parse.
+// skip's (already collected). It parses only the files that can declare a
+// name the formatted file looks up (see fileInfo.needed).
 func (f *formatter) dirNames(dir, skip string, into *names) {
 	self, _ := os.Stat(skip)
 	files, _ := os.ReadDir(dir)
@@ -169,15 +177,139 @@ func (f *formatter) dirNames(dir, skip string, into *names) {
 		if err != nil || !info.Mode().IsRegular() || self != nil && os.SameFile(info, self) {
 			continue
 		}
-		if src, err := os.ReadFile(path); err != nil || !bytes.Contains(src, []byte(f.cfg.Naming.Replace)) {
-			continue
-		}
-		root, err := parser.ParseTerraformFile(path)
+		src, err := os.ReadFile(path)
 		if err != nil {
 			continue
 		}
-		of := &formatter{cfg: f.cfg, root: root, tfvars: ext == ".tfvars"}
-		into.collect(of, of.planFile())
+		if fi := f.fileInfo(path, src); fi.needed(f.lookups()) {
+			if n := fi.load(f.cfg, path, src); n != nil {
+				into.merge(n)
+			}
+		}
+	}
+}
+
+// fileCache holds a fileInfo per file contents and configuration, so that
+// formatting every file of a directory parses each file once at most, not
+// once per file of the directory.
+// shortcut: never emptied; it grows with the distinct files a process
+// reads, fine for the CLI; bound it if format runs in a long-lived server.
+var fileCache = struct {
+	sync.Mutex
+	m map[fileKey]*fileInfo
+}{m: map[fileKey]*fileInfo{}}
+
+type fileKey struct {
+	sum    [sha256.Size]byte
+	tfvars bool
+	cfg    string
+}
+
+// fileInfo is what the naming rule needs from another file.
+type fileInfo struct {
+	decls map[string]bool // its dashed words not right after a ".": where a name it declares can be
+	other bool            // it holds a local module source or an ignore_naming marker
+	once  sync.Once
+	names *names // what it declares, once loaded; nil when it does not parse
+}
+
+func (f *formatter) fileInfo(path string, src []byte) *fileInfo {
+	if f.cfgKey == "" {
+		f.cfgKey = fmt.Sprintf("%#v", *f.cfg)
+	}
+	key := fileKey{sha256.Sum256(src), filepath.Ext(path) == ".tfvars", f.cfgKey}
+	fileCache.Lock()
+	defer fileCache.Unlock()
+	fi, ok := fileCache.m[key]
+	if !ok {
+		fi = &fileInfo{decls: map[string]bool{}}
+		fi.other = bytes.Contains(src, []byte("./")) || bytes.Contains(src, []byte(f.cfg.IgnorePrefix+config.RuleNaming))
+		f.words(src, func(w string, dot bool) {
+			if !dot {
+				fi.decls[w] = true
+			}
+		})
+		fileCache.m[key] = fi
+	}
+	return fi
+}
+
+// needed reports whether the file can declare a name a file with these
+// dashed words looks up: every name looked up is a dashed word of the file
+// that looks it up (a reference, a .tfvars or argument name, a variable
+// label), and a file that declares it holds it as a word not right after a
+// "."; module sources and markers are looked up by undashed names too.
+func (fi *fileInfo) needed(lookups map[string]bool) bool {
+	if fi.other {
+		return true
+	}
+	a, b := fi.decls, lookups
+	if len(b) < len(a) {
+		a, b = b, a
+	}
+	for w := range a {
+		if b[w] {
+			return true
+		}
+	}
+	return false
+}
+
+// load returns the names the file declares, parsing it the first time.
+func (fi *fileInfo) load(cfg *config.Config, path string, src []byte) *names {
+	fi.once.Do(func() {
+		root, err := parser.Parse(src, path)
+		if err != nil {
+			return
+		}
+		of := &formatter{cfg: cfg, root: root, tfvars: filepath.Ext(path) == ".tfvars"}
+		fi.names = newNames()
+		fi.names.collect(of, of.planFile())
+	})
+	return fi.names
+}
+
+// lookups returns the dashed words of the file being formatted.
+func (f *formatter) lookups() map[string]bool {
+	if f.want == nil {
+		f.want = map[string]bool{}
+		src, _ := os.ReadFile(f.path)
+		f.words(src, func(w string, _ bool) { f.want[w] = true })
+	}
+	return f.want
+}
+
+// words calls fn on each run of name bytes in src (letters, digits, "_",
+// "-" and non-ASCII bytes) that holds what the naming rule replaces; dot
+// says a "." comes right before it.
+func (f *formatter) words(src []byte, fn func(w string, dot bool)) {
+	start := -1
+	for i := 0; i <= len(src); i++ {
+		if i < len(src) {
+			if c := src[i]; c >= 0x80 || c == '_' || c == '-' || '0' <= c && c <= '9' || 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' {
+				if start < 0 {
+					start = i
+				}
+				continue
+			}
+		}
+		if start >= 0 && bytes.Contains(src[start:i], []byte(f.cfg.Naming.Replace)) {
+			fn(string(src[start:i]), start > 0 && src[start-1] == '.')
+		}
+		start = -1
+	}
+}
+
+// merge adds what o declares, as collect would have.
+func (n *names) merge(o *names) {
+	for k, v := range o.renamed {
+		n.renamed[k] = v
+	}
+	for k := range o.whole {
+		n.whole[k] = true
+	}
+	for k, v := range o.sources {
+		n.sources[k] = v
 	}
 }
 
@@ -191,13 +323,13 @@ func (f *formatter) decl() *names {
 	return f.names
 }
 
-// childRenames reports whether the local child module that module call m
-// declares output o and the naming rule renames it there.
-func (f *formatter) childRenames(m, o string) bool {
-	src, ok := f.decl().sources[m]
-	if !ok || !strings.Contains(o, f.cfg.Naming.Replace) {
-		return false
-	}
+// localSource reports whether a module source is a local child module's.
+func localSource(src string) bool {
+	return strings.HasPrefix(src, "./") || strings.HasPrefix(src, "../")
+}
+
+// child returns the names the local child module at src declares.
+func (f *formatter) child(src string) *names {
 	dir := filepath.Join(filepath.Dir(f.path), src)
 	if f.children == nil {
 		f.children = map[string]*names{}
@@ -208,5 +340,15 @@ func (f *formatter) childRenames(m, o string) bool {
 		f.dirNames(dir, "", c)
 		f.children[dir] = c
 	}
-	return c.renames("output." + o)
+	return c
+}
+
+// childRenames reports whether the local child module that module call m
+// declares output o and the naming rule renames it there.
+func (f *formatter) childRenames(m, o string) bool {
+	if !f.dashed(o) {
+		return false
+	}
+	src, ok := f.decl().sources[m]
+	return ok && f.child(src).renames("output."+o)
 }

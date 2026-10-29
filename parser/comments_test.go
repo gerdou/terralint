@@ -3,10 +3,12 @@ package parser
 // Checks that the AST holds every comment and how templates were written.
 
 import (
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unicode"
 
 	"github.com/gerdou/terralint/parser/types"
@@ -361,6 +363,25 @@ func TestOpenCommentOwner(t *testing.T) {
 		if got := holder(reflect.ValueOf(root), "c"); got != c.want {
 			t.Errorf("%s: held as %s, want %s", c.value, got, c.want)
 		}
+	}
+}
+
+func TestOpenCommentCost(t *testing.T) {
+	// A long list with a comment per entry, wrapped in a call: finding the
+	// owner of each comment must not cost as much as the list (R8a-001).
+	// Quadratic, 16,000 entries took over 5s; linear, they take well under 1s.
+	var b strings.Builder
+	b.WriteString("locals {\n  allowed = toset([\n")
+	for i := 0; i < 16000; i++ {
+		fmt.Fprintf(&b, "    \"10.%d.%d.0/24\", # subnet %d\n", i/256%256, i%256, i)
+	}
+	b.WriteString("  ])\n}\n")
+	start := time.Now()
+	if _, err := Parse([]byte(b.String()), "big.tf"); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("parsing 16,000 commented entries in toset([ took %s, want under 2s", took)
 	}
 }
 

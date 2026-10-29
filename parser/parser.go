@@ -472,13 +472,17 @@ func (c *converter) openComment(parent, e types.Expression, i int) *string {
 	default:
 		return nil
 	}
-	ch := c.children(e)
+	// The line checks come first: children(e) costs as much as e has parts,
+	// and this runs for every comment inside e.
 	line, start := e.Range().Start.Line, e.Range().Start.Byte
-	if tok := c.comments[i]; len(ch) == 0 || tok.Range.Start.Line != line || lastLine(tok) != line || ch[0].Range().Start.Line == line {
+	if tok := c.comments[i]; tok.Range.Start.Line != line || lastLine(tok) != line {
 		return nil // a /* */ comment over several lines leads the first part, where its later lines print
 	}
 	if prev := c.comments[max(i-1, 0)]; i > 0 && prev.Range.Start.Line == line && prev.Range.Start.Byte > start {
 		return nil // a second comment on that line, which prints below the first
+	}
+	if ch := c.children(e); len(ch) == 0 || ch[0].Range().Start.Line == line {
+		return nil
 	}
 	return open
 }
