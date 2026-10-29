@@ -247,24 +247,33 @@ func (f *formatter) renameExpr(e types.Expression, on bool, iters map[string]boo
 		return true, ref.Parts[0] == "each"
 	}
 	outputs := f.renames("output")
-	// renamed returns the names of ref that are renamed, parts[from:], and
-	// whether the steps after it are. After module.<name> comes the name of
-	// one of the child module's outputs, which keeps its name when outputs
-	// do (output): the third part, or else the first attribute step after
-	// the reference. What follows it reads the output's value, whose keys
-	// the child renames.
-	renamed := func(ref *types.ReferenceExpr) (from int, output, steps bool) {
+	// renamed returns which parts of ref keep their names, and whether the
+	// steps after it are renamed. After module.<name> comes the name of one
+	// of the child module's outputs, which keeps its name when outputs do
+	// (output): the third part, or else the first attribute step after the
+	// reference. What follows it reads the output's value, whose keys the
+	// child renames. A reference through a local alias keeps the local's
+	// name as the local does, and the rest as a read of what the local
+	// aliases would (D16).
+	renamed := func(ref *types.ReferenceExpr) (keep func(int) bool, output, steps bool) {
 		switch {
 		case ref == nil:
-			return 0, false, true
+			return func(int) bool { return false }, false, true
 		case len(ref.Parts) == 1 && f.exempt.names[ref.Parts[0]]:
-			return len(ref.Parts), false, false
+			return func(int) bool { return true }, false, false
 		}
-		n, deep := f.exempt.covers(ref.Parts)
-		if deep {
-			return len(ref.Parts), false, false
-		}
-		return n, ref.Parts[0] == "module" && !outputs, true
+		read, alias := f.through(ref.Parts)
+		own, _ := f.exempt.covers(ref.Parts[:min(2, len(ref.Parts))])
+		shift := len(read) - len(ref.Parts) // read[i+shift] is ref.Parts[i], from the third part on
+		n, deep := f.exempt.covers(read)
+		output = !deep && read[0] == "module" && !outputs
+		return func(i int) bool {
+			if alias && i < 2 {
+				return i < own
+			}
+			i += shift
+			return deep || i < n || output && i == 2
+		}, output, !deep
 	}
 	first := map[types.Expression]bool{} // traversals whose first attribute step is an output's name
 	keys := map[types.Expression]bool{}  // traversals that read through an iterator
@@ -293,9 +302,9 @@ func (f *formatter) renameExpr(e types.Expression, on bool, iters map[string]boo
 				x.Parts = parts
 				break
 			}
-			from, output, _ := renamed(x)
-			for i := from; i < len(parts); i++ {
-				if !output || i != 2 {
+			keep, _, _ := renamed(x)
+			for i := range parts {
+				if !keep(i) {
 					parts[i] = f.name(parts[i])
 				}
 			}
@@ -306,7 +315,7 @@ func (f *formatter) renameExpr(e types.Expression, on bool, iters map[string]boo
 				break
 			}
 			_, output, steps := renamed(rootRef(x.Source))
-			first[x] = first[x] || output && !readsOutput(x.Source)
+			first[x] = first[x] || output && !f.readsOutput(x.Source)
 			if steps {
 				f.renameSteps(x.Traversal, first[x], f.name)
 			}
@@ -318,7 +327,7 @@ func (f *formatter) renameExpr(e types.Expression, on bool, iters map[string]boo
 			_, output, steps := renamed(rootRef(x.Source))
 			if !steps {
 				walk(x.Each, func(y types.Expression) { skip[y] = true })
-			} else if each, ok := x.Each.(*types.RelativeTraversalExpr); ok && output && !readsOutput(x.Source) {
+			} else if each, ok := x.Each.(*types.RelativeTraversalExpr); ok && output && !f.readsOutput(x.Source) {
 				first[each] = true
 			}
 		case *types.ForArrayExpr:
@@ -346,18 +355,20 @@ func (f *formatter) renameSteps(steps []types.TraversalElem, keepFirst bool, ren
 	}
 }
 
-// readsOutput reports whether a chain that starts at module.<name> has an
-// attribute step after those two parts: the name of the output it reads.
-func readsOutput(e types.Expression) bool {
+// readsOutput reports whether a chain that starts at module.<name>, or at a
+// local alias of it, has an attribute step after those two parts: the name
+// of the output it reads.
+func (f *formatter) readsOutput(e types.Expression) bool {
 	switch x := e.(type) {
 	case *types.ReferenceExpr:
-		return len(x.Parts) > 2
+		read, _ := f.through(x.Parts)
+		return len(read) > 2
 	case *types.RelativeTraversalExpr:
-		return readsOutput(x.Source) || slices.ContainsFunc(x.Traversal, func(s types.TraversalElem) bool { return s.Type == "attr" })
+		return f.readsOutput(x.Source) || slices.ContainsFunc(x.Traversal, func(s types.TraversalElem) bool { return s.Type == "attr" })
 	case *types.IndexExpr:
-		return readsOutput(x.Collection)
+		return f.readsOutput(x.Collection)
 	case *types.SplatExpr:
-		return readsOutput(x.Source) || readsOutput(x.Each)
+		return f.readsOutput(x.Source) || f.readsOutput(x.Each)
 	}
 	return false
 }

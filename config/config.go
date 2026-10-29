@@ -66,14 +66,22 @@ type Naming struct {
 	// assignment, written in the declaration or in any assignment, since
 	// either marker keeps both; or a name inside a marked item).
 	//
+	// A local whose value is a plain reference path (local.pool =
+	// var.pools["default"]: a reference with indexes and attribute steps
+	// only) is an alias: the steps read through it keep or lose their
+	// names as reads of what it aliases would, whatever marker the local
+	// carries (its own name follows its own). Reads through a local built
+	// otherwise (a call, an object, a conditional) follow the local's
+	// marker, and are not traced further.
+	//
 	// Without "output", a read of a module call's output keeps the output's
 	// name (module.<name>.<output>, after an index or [*] too), and the keys
 	// read after it are renamed, as the child renames its output's value.
-	// Reads that do not start at module.<name> are renamed in full, because
-	// the formatter cannot tell they read an output, and then no longer
-	// match it: through a for-expression variable ([for m in module.x :
-	// m.out]), a function's result (values(module.x)[0].out) or remote
-	// state (outputs.<name>).
+	// Reads that do not start at module.<name> (or at a local alias of it)
+	// are renamed in full, because the formatter cannot tell they read an
+	// output, and then no longer match it: through a for-expression
+	// variable ([for m in module.x : m.out]), a function's result
+	// (values(module.x)[0].out) or remote state (outputs.<name>).
 	//
 	// "provider" is left out by default: provider local names keep their
 	// dashes wherever they appear (required_providers and everything in it,

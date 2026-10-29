@@ -84,9 +84,10 @@ func (o *ObjectExpr) Range() hcl.Range {
 // ArrayExpr represents array/list expressions
 type ArrayExpr struct {
 	ExprComments
-	Items      []Expression
-	EndComment string // The comments after the last element (or the opening bracket, when there is none), on their own lines, one per line
-	ExprRange  hcl.Range
+	Items       []Expression
+	OpenComment string // When the list is an element of a list or an argument of a call: the first comment on its opening bracket's line, after it, when it ends on that line and the first element starts on a later line (a later comment on that line, or a /* */ comment over several lines, is the first element's LeadComment). When it is also the first comment on an item's first line, the item holds it too, with InlineInside set. Elsewhere, such a comment is the item's InlineComment on the item's first line, and the first element's LeadComment on any other line
+	EndComment  string // The comments after the last element (or the opening bracket, when there is none), on their own lines, one per line
+	ExprRange   hcl.Range
 }
 
 func (a *ArrayExpr) ExpressionType() string {
@@ -118,6 +119,7 @@ type FunctionCallExpr struct {
 	Name        string // The full name, including any namespace (e.g. "provider::aws::arn_parse")
 	Args        []Expression
 	ExpandFinal bool   // The last argument ends in "..." and its elements are passed as separate arguments
+	OpenComment string // When the call is an element of a list or an argument of a call: the first comment after its opening parenthesis on that line, as ArrayExpr.OpenComment
 	EndComment  string // The comments after the last argument (or the opening parenthesis, when there is none), on their own lines, one per line
 	ExprRange   hcl.Range
 }

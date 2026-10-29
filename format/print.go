@@ -748,7 +748,8 @@ func (p *printer) templateParts(parts []types.Expression) string {
 // (any width inside a template interpolation); else one element per line.
 func (p *printer) list(a *types.ArrayExpr) string {
 	elems, ends := make([]string, len(a.Items)), make([]string, len(a.Items))
-	commented, multi := a.EndComment != "", false
+	open := p.comments(a.OpenComment)
+	commented, multi := a.EndComment != "" || len(open) > 0, false
 	for i, x := range a.Items {
 		n := p.inlined
 		elems[i], ends[i] = p.arg(x)
@@ -768,7 +769,7 @@ func (p *printer) list(a *types.ArrayExpr) string {
 		return one
 	}
 	var b strings.Builder
-	b.WriteString("[\n")
+	b.WriteString("[" + p.open(open) + "\n")
 	for i, x := range a.Items {
 		b.WriteString(p.element(x, elems[i], ends[i], ","))
 	}
@@ -822,11 +823,13 @@ func (p *printer) element(x types.Expression, s, end, sep string) string {
 	return out
 }
 
-// call prints a function call: arguments on one line, unless one holds
-// comments or one before the last spans lines; then one per line.
+// call prints a function call: arguments on one line, unless the call or
+// an argument holds comments or one before the last spans lines; then one
+// per line.
 func (p *printer) call(f *types.FunctionCallExpr) string {
 	args, ends := make([]string, len(f.Args)), make([]string, len(f.Args))
-	commented, multi := f.EndComment != "", false
+	open := p.comments(f.OpenComment)
+	commented, multi := f.EndComment != "" || len(open) > 0, false
 	for i, x := range f.Args {
 		n := p.inlined
 		args[i], ends[i] = p.arg(x)
@@ -842,7 +845,7 @@ func (p *printer) call(f *types.FunctionCallExpr) string {
 		return f.Name + "(" + strings.Join(args, ", ") + expand + ")"
 	}
 	var b strings.Builder
-	b.WriteString(f.Name + "(\n")
+	b.WriteString(f.Name + "(" + p.open(open) + "\n")
 	for i, x := range f.Args {
 		sep := ","
 		if i == len(f.Args)-1 && f.ExpandFinal {
@@ -878,13 +881,7 @@ func (p *printer) object(o *types.ObjectExpr) string {
 		return "{ " + strings.Join(items, ", ") + " }"
 	}
 	var b strings.Builder
-	b.WriteString("{")
-	if len(open) > 0 {
-		// It ends the brace's line, so the next run reads it back here.
-		p.inlined++
-		b.WriteString(" " + strings.Join(open, "\n"))
-	}
-	b.WriteString("\n")
+	b.WriteString("{" + p.open(open) + "\n")
 	for _, item := range items {
 		b.WriteString(item + "\n")
 	}
@@ -893,6 +890,17 @@ func (p *printer) object(o *types.ObjectExpr) string {
 	}
 	b.WriteString("}")
 	return b.String()
+}
+
+// open prints the lines of a list's, call's or object's OpenComment at the
+// end of its opening bracket's line, where the next run reads the first one
+// back, and counts them as printed in place.
+func (p *printer) open(lines []string) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	p.inlined++
+	return " " + strings.Join(lines, "\n")
 }
 
 // objectItem prints an object item with its comments, and tells whether it

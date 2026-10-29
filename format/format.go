@@ -62,7 +62,8 @@ func (f *formatter) on(off offSet, rule string) bool {
 type exemptions struct {
 	prefixes []prefix
 	names    map[string]bool
-	keys     map[string]bool // the names inside the items that ignore_naming markers keep whole (see formatter.readName)
+	keys     map[string]bool     // the names inside the items that ignore_naming markers keep whole (see formatter.readName)
+	aliases  map[string][]string // the locals whose value is a plain reference path, by renamed name, and that path (see formatter.through)
 }
 
 // prefix is the start of the references to an exempt name. When deep, the
@@ -84,7 +85,7 @@ var declaring = []string{"variable", "module", "resource", "data", "ephemeral"}
 // Naming.Labels, or they may declare or set a variable whose keys a marker
 // keeps; files that do not parse are skipped.
 func (f *formatter) exemptions(path string) *exemptions {
-	ex := &exemptions{names: map[string]bool{}, keys: map[string]bool{}}
+	ex := &exemptions{names: map[string]bool{}, keys: map[string]bool{}, aliases: map[string][]string{}}
 	word := []byte(f.cfg.IgnorePrefix + config.RuleNaming)
 	every := false
 	for _, t := range declaring {
@@ -140,12 +141,18 @@ func (f *formatter) exemptions(path string) *exemptions {
 	}
 	// A marker on a variable's declaration or on a .tfvars assignment keeps
 	// the keys of the declaration and of every assignment (see renamePlan),
-	// so the names in all of them count as kept (D14).
+	// so the names in all of them count as kept (D14). Reads through a local
+	// alias follow what it aliases (D16), so where a read can keep its steps
+	// (a marker keeps them, or outputs keep their names), the locals of
+	// every file count.
+	kept := !f.renames("output") || slices.ContainsFunc(ex.prefixes, func(p prefix) bool { return p.deep })
 	for _, s := range sibs {
-		if s.top == nil && slices.ContainsFunc(ex.prefixes, func(p prefix) bool {
+		if s.top == nil && (kept && bytes.Contains(s.src, []byte("locals")) || slices.ContainsFunc(ex.prefixes, func(p prefix) bool {
 			return p.deep && len(p.parts) == 2 && p.parts[0] == "var" && bytes.Contains(s.src, []byte(p.parts[1]))
-		}) {
-			load(s)
+		})) && load(s) {
+			for _, e := range s.top.all() {
+				ex.collect(s.of, e)
+			}
 		}
 	}
 	for _, s := range sibs {
@@ -215,8 +222,19 @@ func (ex *exemptions) collect(f *formatter, e *entry) {
 		}
 		if n.Type == "locals" {
 			for _, le := range e.plan.all() {
-				if a, ok := le.node.(*types.Attribute); ok && !f.on(le.off, config.RuleNaming) {
-					ex.prefixes = append(ex.prefixes, prefix{[]string{"local", a.Name}, true})
+				a, ok := le.node.(*types.Attribute)
+				if !ok {
+					continue
+				}
+				// Reads through an alias follow what it aliases (D16), so a
+				// marker on it keeps only its name. Keyed by renamed name:
+				// apply -d may have rewritten its file already.
+				p := path(a.Value)
+				if p != nil {
+					ex.aliases[f.name(a.Name)] = p
+				}
+				if !f.on(le.off, config.RuleNaming) {
+					ex.prefixes = append(ex.prefixes, prefix{[]string{"local", a.Name}, p == nil})
 				}
 			}
 		}
@@ -266,6 +284,45 @@ func declares(b *types.Block) []string {
 		return []string{label(0)}
 	}
 	return nil
+}
+
+// path returns the names a plain reference path reads (var.x, var.x["k"],
+// local.y.z, module.m.out: indexes and attribute steps only): its reference,
+// then its attribute steps, without the indexes. nil for any other
+// expression.
+func path(e types.Expression) []string {
+	switch x := e.(type) {
+	case *types.ReferenceExpr:
+		return slices.Clone(x.Parts)
+	case *types.IndexExpr:
+		return path(x.Collection)
+	case *types.RelativeTraversalExpr:
+		p := path(x.Source)
+		for _, s := range x.Traversal {
+			if p != nil && s.Type == "attr" {
+				p = append(p, s.Name)
+			}
+		}
+		return p
+	}
+	return nil
+}
+
+// through returns what a reference that starts at a local alias reads (D16):
+// the path the local aliases, through every alias on the way, then the
+// reference's parts after the local's name. ok is false for any other
+// reference.
+func (f *formatter) through(parts []string) (read []string, ok bool) {
+	seen := map[string]bool{}
+	for len(parts) >= 2 && parts[0] == "local" && !seen[f.name(parts[1])] {
+		p, is := f.exempt.aliases[f.name(parts[1])]
+		if !is {
+			break
+		}
+		seen[f.name(parts[1])] = true
+		parts, ok = append(slices.Clip(p), parts[2:]...), true
+	}
+	return parts, ok
 }
 
 // covers returns how many leading parts of a reference an exemption keeps,

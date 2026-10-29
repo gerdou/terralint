@@ -400,7 +400,8 @@ type commented interface{ Comments() *types.ExprComments }
 // attach gives the comments cs (indexes, in source order, inside e's range)
 // to the part of e they are in or next to: a comment on the line a part ends
 // trails it, any other leads the next part; after the last part, it ends a
-// list, call or object, or trails the last part.
+// list, call or object, or trails the last part. A list or call that is an
+// element of a list or call holds its own opening comment (see openComment).
 func (c *converter) attach(e types.Expression, cs []int) {
 	if o, ok := e.(*types.ObjectExpr); ok {
 		c.attachObject(o, cs)
@@ -413,6 +414,8 @@ func (c *converter) attach(e types.Expression, cs []int) {
 		pos := tok.Range.Start.Byte
 		k := sort.Search(len(ch), func(k int) bool { return ch[k].Range().End.Byte > pos })
 		switch {
+		case k < len(ch) && ch[k].Range().Start.Byte <= pos && c.openComment(e, ch[k], i) != nil:
+			appendComment(c.openComment(e, ch[k], i), c.join([]int{i}))
 		case k < len(ch) && ch[k].Range().Start.Byte <= pos:
 			buckets[k] = append(buckets[k], i)
 		case k > 0 && tok.Range.Start.Line == ch[k-1].Range().End.Line:
@@ -441,6 +444,39 @@ func (c *converter) attach(e types.Expression, cs []int) {
 			c.attach(ch[k], b)
 		}
 	}
+}
+
+// openComment returns the field that holds comment i, which is inside e,
+// an element or argument of parent, when both are lists or calls and i is
+// the first comment after e's opening bracket on its line, ends on that
+// line, and comes before e's first part on a later line: D13 gives it to e,
+// not to that part. Else nil. (In a list or call that is not an element of
+// one, such a comment is the item's on the item's first line, see inValue,
+// and leads the first part on other lines.)
+func (c *converter) openComment(parent, e types.Expression, i int) *string {
+	var open *string
+	switch e := e.(type) {
+	case *types.ArrayExpr:
+		open = &e.OpenComment
+	case *types.FunctionCallExpr:
+		open = &e.OpenComment
+	default:
+		return nil
+	}
+	switch parent.(type) {
+	case *types.ArrayExpr, *types.FunctionCallExpr:
+	default:
+		return nil
+	}
+	ch := c.children(e)
+	line, start := e.Range().Start.Line, e.Range().Start.Byte
+	if tok := c.comments[i]; len(ch) == 0 || tok.Range.Start.Line != line || lastLine(tok) != line || ch[0].Range().Start.Line == line {
+		return nil // a /* */ comment over several lines leads the first part, where its later lines print
+	}
+	if prev := c.comments[max(i-1, 0)]; i > 0 && prev.Range.Start.Line == line && prev.Range.Start.Byte > start {
+		return nil // a second comment on that line, which prints below the first
+	}
+	return open
 }
 
 // attachObject is attach for an object, whose items hold their own leading

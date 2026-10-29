@@ -327,6 +327,40 @@ func TestInlineOwner(t *testing.T) {
 	}
 }
 
+// A comment after the opening bracket of a list or call that is an element
+// of a list or an argument of a call, before its first element on a later
+// line, belongs to that list or call (D13), not to its first element: it is
+// its OpenComment, on any line. A second comment on that line is the first
+// element's; an empty list ends with it. In a list or call that is no
+// element of one, such a comment is the item's on the item's first line
+// (where it is when printed there) and the first element's on other lines,
+// as before (R6c-001).
+func TestOpenCommentOwner(t *testing.T) {
+	for _, c := range []struct{ value, want string }{
+		{"toset([ # c\n  \"a\"])", "OpenComment"},
+		{"[[ # c\n  \"a\"]]", "OpenComment"},
+		{"[[\n  \"a\"], [ # c\n  \"b\"]]", "OpenComment"},
+		{"concat([ # c\n  # d\n  \"a\"], var.b)", "OpenComment"},
+		{"coalescelist(var.list, [ # c\n  \"a\"])", "OpenComment"},
+		{"var.on ? concat([ # c\n  \"b\"], var.l) : []", "OpenComment"},
+		{"try(coalesce( # c\n  var.a), null)", "OpenComment"},
+		{"merge(var.a,\n  tomap( # c\n    { b = 1 }))", "OpenComment"},
+		{"concat([ /* a */ # c\n  \"b\"], var.l)", "LeadComment"},
+		{"[ /* a */ # c\n  \"b\"]", "LeadComment"},
+		{"toset([ # c\n])", "EndComment"},
+		{"var.a == try( # c\n  var.b)", "InlineComment"},
+		{"concat([\n  1]) == try( # c\n  var.b)", "LeadComment"},
+		{"[for x in var.l :\n  [ # c\n  x]]", "LeadComment"},
+	} {
+		src := "x = " + c.value + "\n"
+		root := parseSource(t, src)
+		checkHeld(t, c.value, []byte(src), root)
+		if got := holder(reflect.ValueOf(root), "c"); got != c.want {
+			t.Errorf("%s: held as %s, want %s", c.value, got, c.want)
+		}
+	}
+}
+
 // How comments are held: a # or // comment without its marker and one
 // space, unless that text would read as another comment.
 func TestCommentText(t *testing.T) {

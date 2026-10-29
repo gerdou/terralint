@@ -2074,3 +2074,174 @@ variable "buckets" {
 		t.Errorf("main.tf:\n%s\nwant:\n%s", got, want)
 	}
 }
+
+func TestRound6Comments(t *testing.T) {
+	// A comment after the opening bracket of a list or call that is an
+	// argument or element is that list's or call's own (D13): it stays at
+	// the end of the bracket's line, apart from the first element's own
+	// comment (R6c-001). check also formats the output again.
+	check(t, nil, `module "vpc" {
+  source = "./vpc"
+  azs    = toset([ # all zones in the region
+    "us-east-1a",
+    "us-east-1b",
+  ])
+  subnet_groups = [[ # public
+    "10.0.1.0/24",
+  ], [ # private
+    "10.0.3.0/24",
+  ]]
+  cidr_blocks = concat([ # private ranges
+    # corporate VPN
+    "10.0.0.0/8",
+  ], var.extra_cidrs)
+  defaults = var.c ? coalescelist(var.list, [ # defaults
+    "a",
+  ]) : []
+  billing = try(coalesce( # type: string
+    local.a,
+    local.b
+  ), null)
+}
+`, `module "vpc" {
+  source = "./vpc"
+
+  azs = toset(
+    [ # all zones in the region
+      "us-east-1a",
+      "us-east-1b",
+    ],
+  )
+
+  billing = try(
+    coalesce( # type: string
+      local.a,
+      local.b,
+    ),
+    null,
+  )
+
+  cidr_blocks = concat(
+    [ # private ranges
+      # corporate VPN
+      "10.0.0.0/8",
+    ],
+    var.extra_cidrs,
+  )
+
+  defaults = var.c ? coalescelist(
+    var.list,
+    [ # defaults
+      "a",
+    ],
+  ) : []
+
+  subnet_groups = [
+    [ # public
+      "10.0.1.0/24",
+    ],
+    [ # private
+      "10.0.3.0/24",
+    ],
+  ]
+}
+`)
+}
+
+func TestRound6Naming(t *testing.T) {
+	// A local whose value is a plain reference path is an alias: reads
+	// through it keep or rename their steps as reads of what it aliases
+	// would, whatever marker the local carries; the local's own name
+	// follows its own marker (D16, R6b-001).
+	files := map[string]string{
+		"main.tf": `# terralint ignore_naming
+variable "node-pools" {
+  type = map(object({
+    machine-type = string
+    min-count    = number
+  }))
+}
+
+variable "app-settings" {
+  type = object({
+    log-level = string
+  })
+}
+
+locals {
+  default-pool = var.node-pools["default"]
+}
+
+# terralint ignore_naming {
+locals {
+  app-cfg = var.app-settings
+}
+# }
+
+resource "google_container_node_pool" "default" {
+  node_count   = local.default-pool.min-count
+  machine_type = local.default-pool["machine-type"]
+  level        = local.app-cfg.log-level
+}
+`,
+	}
+	want := `locals {
+  default_pool = var.node-pools["default"]
+}
+
+# terralint ignore_naming {
+locals {
+  app-cfg = var.app_settings
+}
+# }
+
+resource "google_container_node_pool" "default" {
+  level        = local.app-cfg.log_level
+  machine_type = local.default_pool["machine-type"]
+  node_count   = local.default_pool.min-count
+}
+
+variable "app_settings" {
+  type = object({
+    log_level = string
+  })
+}
+
+# terralint ignore_naming
+variable "node-pools" {
+  type = map(object({
+    machine-type = string
+    min-count    = number
+  }))
+}
+`
+	if got := formatSource(t, config.Default(), "main.tf", files); got != want {
+		t.Errorf("main.tf:\n%s\nwant:\n%s", got, want)
+	}
+
+	// Aliases chain, and are found in files without a marker, before or
+	// after apply -d has renamed them (locals.tf is already formatted here).
+	// A local built from a call is not traced: its steps are renamed.
+	files = map[string]string{
+		"vars.tf": "# terralint ignore_naming\nvariable \"node-pools\" {\n  type = map(any)\n}\n",
+		"locals.tf": `locals {
+  default_pool = local.pools["default"]
+  merged       = merge(var.node-pools, {})
+  pools        = var.node-pools
+}
+`,
+		"main.tf": `resource "google_container_node_pool" "default" {
+  node_count = local.default-pool.min-count
+  untraced   = local.merged["default"].min-count
+}
+`,
+	}
+	want = `resource "google_container_node_pool" "default" {
+  node_count = local.default_pool.min-count
+  untraced   = local.merged["default"].min_count
+}
+`
+	if got := formatSource(t, config.Default(), "main.tf", files); got != want {
+		t.Errorf("main.tf:\n%s\nwant:\n%s", got, want)
+	}
+}
