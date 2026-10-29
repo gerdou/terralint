@@ -123,9 +123,12 @@ func (pl *plan) units() []unit {
 // blocks of a type also found outside them, so that the blocks of that type
 // keep their source order whatever the anchor sorts to (D15): right after
 // the last such block before the section (or the section holding it), or
-// else right before the first such block after it. The first such type in
-// the section decides. Sections that must stay where they are, at the end
-// of the body or after the section they end, keep their anchor.
+// else right before the first such block after it that is outside every
+// section; the sections holding such blocks in between follow this one
+// through their own last block. With no such block before or free after,
+// the section keeps its anchor. The first such type in the section decides.
+// Sections that must stay where they are, at the end of the body or after
+// the section they end, keep their anchor.
 func (pl *plan) keepTypeOrder() {
 	holder := map[*entry]any{}
 	for _, e := range pl.free {
@@ -151,24 +154,28 @@ func (pl *plan) keepTypeOrder() {
 		for _, e := range s.entries {
 			t := blockType(e)
 			var last, next *entry
+			seen := false // a block of type t after e, free or not
 			for _, o := range all {
 				if t == "" || holder[o] == s || blockType(o) != t {
 					continue
 				}
-				if start(o.node) < start(e.node) {
+				switch {
+				case start(o.node) < start(e.node):
 					last = o
-				} else if next == nil {
-					next = o
+				case next == nil && holder[o] == o:
+					next, seen = o, true
+				default:
+					seen = true
 				}
 			}
-			if last == nil && next == nil {
+			if last == nil && !seen {
 				continue
 			}
 			if last != nil {
 				s.anchor = holder[last]
-			} else if holder[next] == next {
+			} else if next != nil {
 				s.before = next
-			} // else a section holds it, which follows this one when that type decides for it
+			}
 			break
 		}
 	}

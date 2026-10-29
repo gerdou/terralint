@@ -61,8 +61,10 @@ type Naming struct {
 	// block's <iterator>.value.<key>, a for-expression variable's <v>.<key>)
 	// are not traced to what declares them: they are renamed, inside items
 	// under ignore_naming too, unless some ignore_naming marker in the
-	// directory keeps a name like them (a key of a marked variable, .tfvars
-	// assignment or locals entry, or a name inside a marked item).
+	// directory keeps a name like them (a key of a marked locals entry; a
+	// key of a variable marked on its declaration or on a .tfvars
+	// assignment, written in the declaration or in any assignment, since
+	// either marker keeps both; or a name inside a marked item).
 	//
 	// Without "output", a read of a module call's output keeps the output's
 	// name (module.<name>.<output>, after an index or [*] too), and the keys

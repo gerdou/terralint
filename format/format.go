@@ -62,7 +62,7 @@ func (f *formatter) on(off offSet, rule string) bool {
 type exemptions struct {
 	prefixes []prefix
 	names    map[string]bool
-	keys     map[string]bool // the names inside the items under ignore_naming (see formatter.readName)
+	keys     map[string]bool // the names inside the items that ignore_naming markers keep whole (see formatter.readName)
 }
 
 // prefix is the start of the references to an exempt name. When deep, the
@@ -81,7 +81,8 @@ var declaring = []string{"variable", "module", "resource", "data", "ephemeral"}
 // exemptions collects the exempt names declared in path and the other .tf
 // and .tfvars files of its directory. Files that do not mention the marker
 // word are not parsed, unless a declaring block type is missing from
-// Naming.Labels; files that do not parse are skipped.
+// Naming.Labels, or they may declare or set a variable whose keys a marker
+// keeps; files that do not parse are skipped.
 func (f *formatter) exemptions(path string) *exemptions {
 	ex := &exemptions{names: map[string]bool{}, keys: map[string]bool{}}
 	word := []byte(f.cfg.IgnorePrefix + config.RuleNaming)
@@ -89,6 +90,24 @@ func (f *formatter) exemptions(path string) *exemptions {
 	for _, t := range declaring {
 		every = every || !f.renames(t)
 	}
+	type sibling struct {
+		path string
+		src  []byte
+		of   *formatter // its root is nil until load parses it
+		top  *plan
+	}
+	load := func(s *sibling) bool {
+		if s.of.root == nil {
+			root, err := parser.ParseTerraformFile(s.path)
+			if err != nil {
+				return false
+			}
+			s.of.root = root
+		}
+		s.top = s.of.planFile()
+		return true
+	}
+	var sibs []*sibling
 	self, _ := os.Stat(path)
 	dir := filepath.Dir(path)
 	files, _ := os.ReadDir(dir)
@@ -102,27 +121,69 @@ func (f *formatter) exemptions(path string) *exemptions {
 			continue
 		}
 		src, err := os.ReadFile(other)
-		if err != nil || !every && !bytes.Contains(src, word) {
+		if err != nil {
 			continue
 		}
-		root := f.root
-		if self == nil || !os.SameFile(info, self) {
-			if root, err = parser.ParseTerraformFile(other); err != nil {
-				continue
+		s := &sibling{path: other, src: src, of: &formatter{cfg: f.cfg, tfvars: filepath.Ext(other) == ".tfvars"}}
+		if self != nil && os.SameFile(info, self) {
+			s.of.root = f.root
+		}
+		if (every || bytes.Contains(src, word)) && !load(s) {
+			continue
+		}
+		sibs = append(sibs, s)
+		if s.top != nil {
+			for _, e := range s.top.all() {
+				ex.collect(s.of, e)
 			}
 		}
-		of := &formatter{cfg: f.cfg, root: root, tfvars: filepath.Ext(other) == ".tfvars"}
-		top := of.planFile()
-		for _, e := range top.all() {
-			ex.collect(of, e)
+	}
+	// A marker on a variable's declaration or on a .tfvars assignment keeps
+	// the keys of the declaration and of every assignment (see renamePlan),
+	// so the names in all of them count as kept (D14).
+	for _, s := range sibs {
+		if s.top == nil && slices.ContainsFunc(ex.prefixes, func(p prefix) bool {
+			return p.deep && len(p.parts) == 2 && p.parts[0] == "var" && bytes.Contains(s.src, []byte(p.parts[1]))
+		}) {
+			load(s)
 		}
-		visit(top, func(e *entry, _ *plan) {
-			if !of.on(e.off, config.RuleNaming) {
+	}
+	for _, s := range sibs {
+		if s.top == nil {
+			continue
+		}
+		visit(s.top, func(e *entry, _ *plan) {
+			if !s.of.on(e.off, config.RuleNaming) {
 				ex.keep(e.node)
 			}
 		})
+		for _, e := range s.top.all() {
+			if s.of.keptWhole(ex, e.node) {
+				ex.keep(e.node)
+				if e.plan != nil {
+					visit(e.plan, func(e *entry, _ *plan) { ex.keep(e.node) })
+				}
+			}
+		}
 	}
 	return ex
+}
+
+// keptWhole reports whether top-level item n keeps every name in it
+// because a marker on another item keeps its keys: a variable's declaration
+// or .tfvars assignment (see renamePlan).
+func (f *formatter) keptWhole(ex *exemptions, n types.Body) bool {
+	var p []string
+	switch n := n.(type) {
+	case *types.Attribute:
+		if f.tfvars {
+			p = []string{"var", n.Name}
+		}
+	case *types.Block:
+		p = declares(n)
+	}
+	_, deep := ex.covers(p)
+	return p != nil && deep
 }
 
 // renames reports whether the naming rule renames the names that blocks of

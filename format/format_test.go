@@ -1942,3 +1942,135 @@ resource "null_resource" "setup" {
 }
 `)
 }
+
+func TestRound5Sections(t *testing.T) {
+	// Several sections hold blocks of one type, none comes before them and
+	// a free one follows: the first section goes right before that free
+	// block, and the others follow it, whatever its anchor (origin, which
+	// sorts after the type) sorts to (D15, R5b-001).
+	check(t, nil, `resource "aws_cloudfront_distribution" "cdn" {
+  enabled = true
+
+  origin {
+    origin_id = "api"
+  }
+
+  # terralint api routes {
+  ordered_cache_behavior {
+    path_pattern = "/api/*"
+  }
+  # }
+
+  # terralint static assets {
+  ordered_cache_behavior {
+    path_pattern = "/static/*"
+  }
+  # }
+
+  ordered_cache_behavior {
+    path_pattern = "/*"
+  }
+}
+`, `resource "aws_cloudfront_distribution" "cdn" {
+  enabled = true
+
+  # terralint api routes {
+  ordered_cache_behavior {
+    path_pattern = "/api/*"
+  }
+  # }
+
+  # terralint static assets {
+  ordered_cache_behavior {
+    path_pattern = "/static/*"
+  }
+  # }
+
+  ordered_cache_behavior {
+    path_pattern = "/*"
+  }
+
+  origin {
+    origin_id = "api"
+  }
+}
+`)
+}
+
+func TestRound5Naming(t *testing.T) {
+	// A marker on a .tfvars assignment keeps the keys of the variable's
+	// declaration, so reads of them through each.value or a for-expression
+	// variable (in the declaration's own validation too) keep them (D14,
+	// R5b-002).
+	decl := `variable "node-pools" {
+  type = map(object({
+    machine-type = string
+    min-count    = optional(number, 1)
+  }))
+
+  validation {
+    condition     = alltrue([for p in var.node-pools : p.min-count > 0])
+    error_message = "min-count must be positive."
+  }
+}
+
+resource "google_container_node_pool" "pool" {
+  for_each = var.node-pools
+
+  min_node_count = each.value.min-count
+}
+`
+	want := `resource "google_container_node_pool" "pool" {
+  for_each = var.node-pools
+
+  min_node_count = each.value.min-count
+}
+
+variable "node-pools" {
+  type = map(object({
+    machine-type = string
+    min-count    = optional(number, 1)
+  }))
+
+  validation {
+    condition     = alltrue([for p in var.node-pools : p.min-count > 0])
+    error_message = "min-count must be positive."
+  }
+}
+`
+	files := map[string]string{"main.tf": decl, "terraform.tfvars": "# terralint ignore_naming\nnode-pools = { default = { machine-type = \"e2\" } }\n"}
+	if got := formatSource(t, config.Default(), "main.tf", files); got != want {
+		t.Errorf("main.tf:\n%s\nwant:\n%s", got, want)
+	}
+
+	// A marker on the declaration keeps the keys of the variable's .tfvars
+	// assignments, which do not mention the marker.
+	files = map[string]string{
+		"main.tf": `# terralint ignore_naming
+variable "buckets" {
+  type = map(any)
+}
+
+resource "aws_s3_bucket" "b" {
+  for_each = var.buckets
+
+  force_destroy = each.value.force-destroy
+}
+`,
+		"terraform.tfvars": "buckets = { logs = { force-destroy = true } }\n",
+	}
+	want = `resource "aws_s3_bucket" "b" {
+  for_each = var.buckets
+
+  force_destroy = each.value.force-destroy
+}
+
+# terralint ignore_naming
+variable "buckets" {
+  type = map(any)
+}
+`
+	if got := formatSource(t, config.Default(), "main.tf", files); got != want {
+		t.Errorf("main.tf:\n%s\nwant:\n%s", got, want)
+	}
+}
